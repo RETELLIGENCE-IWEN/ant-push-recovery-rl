@@ -1,0 +1,12 @@
+stable-baselines3==2.8.0
+gymnasium[mujoco]>=1.0.0,<1.3.0
+
+tensorboard
+rich
+tqdm
+
+numpy
+pandas
+matplotlib
+imageio
+imageio-ffmpeg
