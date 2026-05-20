@@ -138,6 +138,8 @@ def main() -> None:
     parser.add_argument("--push-interval-steps-max", type=int, default=1000)
     parser.add_argument("--push-curriculum-ramp-steps", type=int, default=300_000)
     parser.add_argument("--push-initial-quiet-steps", type=int, default=10_000)
+    parser.add_argument("--push-torque-z-max", type=float, default=0.0)
+    parser.add_argument("--push-duration-max-steps", type=int, default=0)
 
     # Domain randomization
     parser.add_argument("--dr-enabled", type=int, default=1)
@@ -180,6 +182,8 @@ def main() -> None:
         push_interval_steps_max=args.push_interval_steps_max,
         curriculum_ramp_steps=args.push_curriculum_ramp_steps,
         initial_quiet_steps=args.push_initial_quiet_steps,
+        push_torque_z_max=args.push_torque_z_max,
+        push_duration_max_steps=args.push_duration_max_steps,
     )
     dr_config = DomainRandomizationConfig(
         enabled=bool(args.dr_enabled),

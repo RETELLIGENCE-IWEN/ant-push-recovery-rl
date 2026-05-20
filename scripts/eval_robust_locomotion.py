@@ -115,8 +115,10 @@ def run_episode(
     push_schedule: list[dict] | None,
 ) -> dict:
     """
-    push_schedule is a list of {"step_start": int, "duration": int, "force_xy": np.array(2)}
-    Forces are applied to torso between [step_start, step_start+duration).
+    push_schedule is a list of {"step_start": int, "duration": int,
+                                "force_xy": np.array(2), "torque_z": float}
+    Forces and torque applied to torso between [step_start, step_start+duration).
+    "torque_z" is optional (default 0).
     """
     env = build_eval_env(use_dr=use_dr, dr_action_noise=dr_action_noise)
     torso_id = get_torso_id(env)
@@ -154,6 +156,7 @@ def run_episode(
                 if p["step_start"] <= t < p["step_start"] + p["duration"]:
                     env.unwrapped.data.xfrc_applied[torso_id, 0] = p["force_xy"][0]
                     env.unwrapped.data.xfrc_applied[torso_id, 1] = p["force_xy"][1]
+                    env.unwrapped.data.xfrc_applied[torso_id, 5] = p.get("torque_z", 0.0)
 
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, terminated, truncated, info = env.step(action)
@@ -267,8 +270,13 @@ def tier_b_push_grid(
     push_at_step: int = 250,
     push_duration: int = 5,
     episodes_per_cell: int = 5,
+    torque_z: float = 0.0,
+    randomize_torque_sign: bool = False,
 ) -> dict:
-    print(f"=== Tier B: Single push grid (push at t={push_at_step*0.01:.1f}s, dur={push_duration*0.01:.2f}s) ===")
+    label = f"Tier B: push at t={push_at_step*0.01:.1f}s, dur={push_duration*0.01:.2f}s"
+    if torque_z != 0.0:
+        label += f", |tau_z|={abs(torque_z):.2f}Nm" + ("(±)" if randomize_torque_sign else "")
+    print(f"=== {label} ===")
     rows = []
     for mag in magnitudes:
         for d_deg in directions_deg:
@@ -276,6 +284,7 @@ def tier_b_push_grid(
             force_xy = np.array([mag * math.cos(theta), mag * math.sin(theta)])
             cell_results = []
             for ep in range(episodes_per_cell):
+                sign = 1.0 if (not randomize_torque_sign or ep % 2 == 0) else -1.0
                 row = run_episode(
                     model=model,
                     seed=2000 + ep,
@@ -286,34 +295,43 @@ def tier_b_push_grid(
                         "step_start": push_at_step,
                         "duration": push_duration,
                         "force_xy": force_xy,
+                        "torque_z": sign * torque_z,
                     }],
                 )
                 row["push_magnitude"] = mag
                 row["push_direction_deg"] = d_deg
+                row["push_duration"] = push_duration
+                row["push_torque_z"] = sign * torque_z
                 rows.append(row)
                 cell_results.append(row)
             surv = sum(r["survived_to_max_steps"] for r in cell_results) / len(cell_results)
-            rec = mean(
-                [r.get("recovery_steps_vx", -1) for r in cell_results if r.get("recovery_steps_vx", -1) > 0]
-                or [-1]
-            )
-            print(f"  mag={mag:.1f}N dir={d_deg:5.1f}° surv={surv:.2f} rec_steps={rec:.0f}")
+            rec_list = [r.get("recovery_steps_vx", -1) for r in cell_results if r.get("recovery_steps_vx", -1) > 0]
+            rec = mean(rec_list) if rec_list else -1
+            mdp = mean([r.get("max_post_push_drift", 0.0) for r in cell_results])
+            print(f"  mag={mag:.1f}N dir={d_deg:5.1f}° surv={surv:.2f} rec_steps={rec:.0f} max_drift={mdp:.2f}m")
     csv_path = out_dir / "tier_b_push_grid.csv"
     with csv_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
-    # Summarize by magnitude
     by_mag = {}
     for mag in magnitudes:
         cell_rows = [r for r in rows if r["push_magnitude"] == mag]
+        rec_list = [r["recovery_steps_vx"] for r in cell_rows if r["recovery_steps_vx"] > 0]
         by_mag[f"mag_{mag:.1f}N"] = {
             "survival_rate": sum(r["survived_to_max_steps"] for r in cell_rows) / len(cell_rows),
-            "mean_recovery_steps": mean([r["recovery_steps_vx"] for r in cell_rows if r["recovery_steps_vx"] > 0]) if any(r["recovery_steps_vx"] > 0 for r in cell_rows) else None,
+            "mean_recovery_steps": mean(rec_list) if rec_list else None,
             "mean_max_drift_post_push": mean([r["max_post_push_drift"] for r in cell_rows]),
             "mean_final_drift": mean([r["abs_lateral_drift"] for r in cell_rows]),
         }
-    return {"tier": "B_push_grid", "magnitudes": magnitudes, "directions_deg": directions_deg, "by_magnitude": by_mag}
+    return {
+        "tier": "B_push_grid",
+        "magnitudes": magnitudes,
+        "directions_deg": directions_deg,
+        "push_duration_steps": push_duration,
+        "torque_z_magnitude": torque_z,
+        "by_magnitude": by_mag,
+    }
 
 
 def tier_c_random_push(model: PPO, out_dir: Path, episodes: int = 10) -> dict:
@@ -396,6 +414,18 @@ def main():
         default="2,4,6,8,10",
         help="Comma-separated push magnitudes in N for Tier B grid.",
     )
+    parser.add_argument(
+        "--tier-b-duration-steps", type=int, default=5,
+        help="Push duration in MuJoCo sub-steps (default 5 = 0.05s).",
+    )
+    parser.add_argument(
+        "--tier-b-torque-z", type=float, default=0.0,
+        help="Add angular torque on torso z-axis (N·m). 0 = linear only.",
+    )
+    parser.add_argument(
+        "--tier-b-randomize-torque-sign", action="store_true",
+        help="Alternate torque sign across episodes (covers both twist directions).",
+    )
     args = parser.parse_args()
 
     torch.set_num_threads(1)
@@ -415,8 +445,10 @@ def main():
             magnitudes=magnitudes,
             directions_deg=[0, 45, 90, 135, 180, 225, 270, 315],
             push_at_step=250,
-            push_duration=5,
+            push_duration=args.tier_b_duration_steps,
             episodes_per_cell=args.tier_b_episodes,
+            torque_z=args.tier_b_torque_z,
+            randomize_torque_sign=args.tier_b_randomize_torque_sign,
         )
     if "c" in args.tiers:
         summaries["C"] = tier_c_random_push(model, out_dir, args.tier_c_episodes)

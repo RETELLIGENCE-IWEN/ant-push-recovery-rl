@@ -32,6 +32,7 @@ def main():
     parser.add_argument("--push-duration", type=int, default=5)
     parser.add_argument("--push-force", type=float, default=10.0)
     parser.add_argument("--push-direction-deg", type=float, default=90.0)
+    parser.add_argument("--push-torque-z", type=float, default=0.0)
     parser.add_argument("--fps", type=int, default=30)
     args = parser.parse_args()
 
@@ -67,6 +68,7 @@ def main():
             if args.push_step <= t < args.push_step + args.push_duration:
                 env.unwrapped.data.xfrc_applied[torso_id, 0] = force_xy[0]
                 env.unwrapped.data.xfrc_applied[torso_id, 1] = force_xy[1]
+                env.unwrapped.data.xfrc_applied[torso_id, 5] = args.push_torque_z
             action, _ = policy.predict(obs, deterministic=True)
             obs, r, term, trunc, info = env.step(action)
             writer.append_data(env.render())

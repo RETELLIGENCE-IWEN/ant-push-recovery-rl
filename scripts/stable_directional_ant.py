@@ -1050,11 +1050,17 @@ class PushDisturbanceConfig:
     enabled: bool = True
     torso_body_name: str = "torso"
     push_force_max: float = 10.0      # N, at end of curriculum
-    push_duration_steps: int = 5       # MuJoCo sub-steps push is held
+    push_duration_steps: int = 5       # MuJoCo sub-steps push is held (held constant)
     push_interval_steps_min: int = 500   # min steps between pushes (5s @ 100Hz)
     push_interval_steps_max: int = 1000  # max steps between pushes (10s @ 100Hz)
     curriculum_ramp_steps: int = 300_000  # per-env steps to reach push_force_max
     initial_quiet_steps: int = 10_000     # warm-up: no pushes for first N env steps
+
+    # Phase 2b stress disturbances (default off; set max > 0 to enable).
+    # All three (force, torque, duration) share the same curriculum progress so
+    # the difficulty ramps coherently.
+    push_torque_z_max: float = 0.0     # N·m, yaw twist around torso z-axis
+    push_duration_max_steps: int = 0   # if > 0, duration is ramped from push_duration_steps to this value
 
 
 class PushDisturbanceWrapper(gym.Wrapper):
@@ -1105,6 +1111,7 @@ class PushDisturbanceWrapper(gym.Wrapper):
         self._push_remaining_steps = 0
         self._current_force_xy = np.zeros(2, dtype=np.float64)
         self._current_force_magnitude = 0.0
+        self._current_torque_z = 0.0
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
@@ -1115,6 +1122,7 @@ class PushDisturbanceWrapper(gym.Wrapper):
         self._push_remaining_steps = 0
         self._current_force_xy[:] = 0.0
         self._current_force_magnitude = 0.0
+        self._current_torque_z = 0.0
         return obs, info
 
     def step(self, action):
@@ -1130,6 +1138,7 @@ class PushDisturbanceWrapper(gym.Wrapper):
         info["push_force_magnitude"] = float(self._current_force_magnitude)
         info["push_force_dir_x"] = float(self._current_force_xy[0] / max(self._current_force_magnitude, 1e-9))
         info["push_force_dir_y"] = float(self._current_force_xy[1] / max(self._current_force_magnitude, 1e-9))
+        info["push_torque_z"] = float(self._current_torque_z)
         info["push_curriculum_force_max"] = float(self._current_max_force())
 
         self._env_step_count += 1
@@ -1139,19 +1148,35 @@ class PushDisturbanceWrapper(gym.Wrapper):
                 self.unwrapped.data.xfrc_applied[self._torso_id, :] = 0.0
                 self._current_force_magnitude = 0.0
                 self._current_force_xy[:] = 0.0
+                self._current_torque_z = 0.0
                 self._next_push_step = self._env_step_count + self._sample_interval()
 
         return obs, reward, terminated, truncated, info
 
-    def _current_max_force(self) -> float:
+    def _curriculum_progress(self) -> float:
         cfg = self.cfg
         if self._env_step_count < cfg.initial_quiet_steps:
             return 0.0
         progress = (self._env_step_count - cfg.initial_quiet_steps) / max(
             cfg.curriculum_ramp_steps, 1
         )
-        progress = float(np.clip(progress, 0.0, 1.0))
-        return cfg.push_force_max * progress
+        return float(np.clip(progress, 0.0, 1.0))
+
+    def _current_max_force(self) -> float:
+        return self.cfg.push_force_max * self._curriculum_progress()
+
+    def _current_max_torque_z(self) -> float:
+        return self.cfg.push_torque_z_max * self._curriculum_progress()
+
+    def _current_push_duration(self) -> int:
+        cfg = self.cfg
+        if cfg.push_duration_max_steps <= cfg.push_duration_steps:
+            return cfg.push_duration_steps
+        progress = self._curriculum_progress()
+        duration = cfg.push_duration_steps + progress * (
+            cfg.push_duration_max_steps - cfg.push_duration_steps
+        )
+        return int(round(duration))
 
     def _sample_interval(self) -> int:
         rng = self.unwrapped.np_random
@@ -1169,26 +1194,34 @@ class PushDisturbanceWrapper(gym.Wrapper):
             return
 
         max_f = self._current_max_force()
-        if max_f <= 0.0:
+        max_tau = self._current_max_torque_z()
+        if max_f <= 0.0 and max_tau <= 0.0:
             self._next_push_step = self._env_step_count + self._sample_interval()
             return
 
         rng = self.unwrapped.np_random
         theta = float(rng.uniform(0.0, 2.0 * math.pi))
-        magnitude = float(rng.uniform(0.0, max_f))
+        magnitude = float(rng.uniform(0.0, max_f)) if max_f > 0.0 else 0.0
         self._current_force_xy[0] = magnitude * math.cos(theta)
         self._current_force_xy[1] = magnitude * math.sin(theta)
         self._current_force_magnitude = magnitude
-        self._push_remaining_steps = self.cfg.push_duration_steps
+        if max_tau > 0.0:
+            self._current_torque_z = float(rng.uniform(-max_tau, max_tau))
+        else:
+            self._current_torque_z = 0.0
+        self._push_remaining_steps = self._current_push_duration()
 
     def _apply_active_force(self) -> None:
+        xfrc = self.unwrapped.data.xfrc_applied
         if self._push_remaining_steps > 0:
-            xfrc = self.unwrapped.data.xfrc_applied
             xfrc[self._torso_id, 0] = self._current_force_xy[0]
             xfrc[self._torso_id, 1] = self._current_force_xy[1]
             xfrc[self._torso_id, 2] = 0.0
+            xfrc[self._torso_id, 3] = 0.0
+            xfrc[self._torso_id, 4] = 0.0
+            xfrc[self._torso_id, 5] = self._current_torque_z
         else:
-            self.unwrapped.data.xfrc_applied[self._torso_id, :] = 0.0
+            xfrc[self._torso_id, :] = 0.0
 
 
 @dataclass(frozen=True)
