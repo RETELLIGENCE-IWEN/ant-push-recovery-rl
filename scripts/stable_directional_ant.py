@@ -664,3 +664,372 @@ class ControlledLocomotionAntWrapper(gym.Wrapper):
 
     def _root_y(self) -> float:
         return float(self.unwrapped.data.qpos[1])
+
+
+@dataclass(frozen=True)
+class WellTrainedLocomotionRewardConfig:
+    """
+    Body-frame command tracking objective (v3d) following legged_gym conventions.
+
+    Commands are expressed in the robot's body frame. With yaw kept near zero by
+    orientation/heading penalties, body-frame and world-frame velocities coincide,
+    but the body-frame formulation breaks the crab-walk / yawed-walk degeneracy
+    that earlier reward formulations admitted as separate local optima.
+    """
+
+    # Command (body frame)
+    target_forward_velocity: float = 2.0
+    target_lateral_velocity: float = 0.0
+    target_yaw_rate: float = 0.0
+    target_height: float = 0.53
+
+    # Command randomization (off by default; reserved for future curriculum work)
+    randomize_commands: bool = False
+    command_forward_velocity_min: float = 1.6
+    command_forward_velocity_max: float = 2.2
+    command_lateral_velocity_min: float = 0.0
+    command_lateral_velocity_max: float = 0.0
+    command_yaw_rate_min: float = 0.0
+    command_yaw_rate_max: float = 0.0
+
+    # Observation normalization
+    velocity_obs_scale: float = 3.0
+    include_command_observation: bool = False
+
+    # Positive tracking rewards (body frame)
+    w_alive: float = 0.10
+    w_track_vx: float = 1.50
+    w_track_vy: float = 1.50
+    w_track_omega_z: float = 0.50
+    sigma_track_v: float = 0.50
+    sigma_track_omega: float = 0.50
+
+    # Linear progress reward in body frame. Breaks the "stand still" local
+    # optimum at the start of training when w_track_vx alone has near-zero
+    # gradient far from the velocity target (legged_gym-style training escapes
+    # this via massive env parallelism; with O(8) envs we instead supply a
+    # linear progress signal that saturates at the target).
+    w_progress_vx: float = 2.0
+
+    # Absolute world-frame heading alignment. Pure body-frame command tracking
+    # is yaw-rotation-invariant: the policy can yaw the body and still satisfy
+    # vx_body/vy_body. This reward anchors the body to the world +x axis (or
+    # any commanded target_yaw) so "go forward" means "go in +x world frame".
+    w_heading_alignment: float = 1.0
+    sigma_heading_alignment: float = 0.50
+    target_yaw: float = 0.0
+
+    # Posture penalties (legged_gym-style). Orientation/base-height kept light
+    # so the policy is not penalized into a "stand still" attractor; tipover
+    # is suppressed jointly by lin_vel_z, ang_vel_xy, and the Ant terminator.
+    w_lin_vel_z: float = 2.0
+    w_ang_vel_xy: float = 0.05
+    w_orientation: float = 1.0
+    w_base_height: float = 1.0
+
+    # Accumulated lateral position drift penalty. Independent of body-frame
+    # vy tracking: stops the slow asymmetric drift that body-frame velocity
+    # tracking alone cannot suppress (it averages out gait-cycle wiggle while
+    # leaving a small mean bias intact).
+    w_lateral_position: float = 0.05
+    lateral_position_clip: float = 5.0
+
+    # Control quality penalties
+    w_action_rate: float = 0.05
+    w_action_accel: float = 0.02
+    w_action_energy: float = 0.005
+    w_dof_vel: float = 0.001
+
+
+class WellTrainedLocomotionAntWrapper(gym.Wrapper):
+    """
+    Body-frame command-tracking objective for v3d (well-trained locomotion).
+
+    Differences from ControlledLocomotionAntWrapper (v3a/b/c):
+
+      - Tracks vx_body, vy_body, omega_z against constant body-frame commands
+        using exp(-error^2 / sigma^2) reward shape (legged_gym convention).
+      - Penalizes orientation (roll, pitch), base height deviation, vertical
+        linear velocity, and xy angular velocity directly.
+      - Includes joint velocity, action energy, action rate, and action
+        acceleration smoothness penalties.
+      - No world-frame lateral position penalty or course-tracking heuristics:
+        crab-walk and yawed-walk are both naturally suppressed by penalizing
+        body-frame vy and roll/pitch orientation.
+
+    The observation is augmented with body-frame linear velocity (vx_body,
+    vy_body), heading sin/cos, and the previous action so the policy sees the
+    signals it must minimize.
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        reward_config: WellTrainedLocomotionRewardConfig | None = None,
+    ):
+        super().__init__(env)
+        if not isinstance(env.observation_space, spaces.Box):
+            raise TypeError(
+                "WellTrainedLocomotionAntWrapper requires a Box observation."
+            )
+
+        self.cfg = reward_config or WellTrainedLocomotionRewardConfig()
+        self.current_target_vx = self.cfg.target_forward_velocity
+        self.current_target_vy = self.cfg.target_lateral_velocity
+        self.current_target_omega_z = self.cfg.target_yaw_rate
+        self.episode_initial_y: float | None = None
+        self.prev_action = np.zeros(self.action_space.shape, dtype=np.float64)
+        self.prev_prev_action = np.zeros(self.action_space.shape, dtype=np.float64)
+
+        # 4 compact signals + 8 prev action = 12 extra dims (no commands by default)
+        compact_signal_dim = 4
+        if self.cfg.include_command_observation:
+            compact_signal_dim += 3
+
+        extra_low = np.concatenate(
+            [
+                -np.ones(compact_signal_dim, dtype=np.float32),
+                np.asarray(self.action_space.low, dtype=np.float32),
+            ]
+        )
+        extra_high = np.concatenate(
+            [
+                np.ones(compact_signal_dim, dtype=np.float32),
+                np.asarray(self.action_space.high, dtype=np.float32),
+            ]
+        )
+        low = np.concatenate(
+            [
+                np.asarray(env.observation_space.low, dtype=np.float32),
+                extra_low,
+            ]
+        )
+        high = np.concatenate(
+            [
+                np.asarray(env.observation_space.high, dtype=np.float32),
+                extra_high,
+            ]
+        )
+        self.observation_space = spaces.Box(
+            low=low,
+            high=high,
+            dtype=env.observation_space.dtype,
+        )
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._sample_command()
+        self.episode_initial_y = float(self.unwrapped.data.qpos[1])
+        self.prev_action = np.zeros(self.action_space.shape, dtype=np.float64)
+        self.prev_prev_action = np.zeros(self.action_space.shape, dtype=np.float64)
+        return self._augment_observation(obs), info
+
+    def step(self, action):
+        obs, base_reward, terminated, truncated, info = self.env.step(action)
+
+        action_np = np.asarray(action, dtype=np.float64)
+        metrics = self.compute_metrics()
+        terms = self._compute_reward_terms(
+            action=action_np,
+            metrics=metrics,
+            terminated=terminated,
+        )
+        reward = float(sum(terms.values()))
+
+        info = dict(info)
+        info["base_reward"] = float(base_reward)
+        info["well_trained_reward"] = reward
+        for key, value in terms.items():
+            info[f"well_trained_{key}"] = float(value)
+        for key, value in metrics.items():
+            info[f"metric_{key}"] = float(value)
+
+        self.prev_prev_action = self.prev_action.copy()
+        self.prev_action = action_np.copy()
+
+        return self._augment_observation(obs), reward, terminated, truncated, info
+
+    def _augment_observation(self, observation):
+        metrics = self.compute_metrics()
+        vx_body_n = self._normalize_velocity(metrics["vx_body"])
+        vy_body_n = self._normalize_velocity(metrics["vy_body"])
+        yaw = metrics["yaw"]
+        compact_signals = [
+            vx_body_n,
+            vy_body_n,
+            math.sin(yaw),
+            math.cos(yaw),
+        ]
+        if self.cfg.include_command_observation:
+            compact_signals.extend(
+                [
+                    self._normalize_velocity(self.current_target_vx),
+                    self._normalize_velocity(self.current_target_vy),
+                    float(np.clip(self.current_target_omega_z / 2.0, -1.0, 1.0)),
+                ]
+            )
+        extra = np.concatenate(
+            [
+                np.array(compact_signals, dtype=self.observation_space.dtype),
+                self.prev_action.astype(self.observation_space.dtype),
+            ]
+        )
+        return np.concatenate(
+            [
+                np.asarray(observation, dtype=self.observation_space.dtype),
+                extra,
+            ]
+        )
+
+    def _compute_reward_terms(
+        self,
+        action: np.ndarray,
+        metrics: dict[str, float],
+        terminated: bool,
+    ) -> dict[str, float]:
+        cfg = self.cfg
+
+        vx_err = metrics["vx_body"] - self.current_target_vx
+        vy_err = metrics["vy_body"] - self.current_target_vy
+        omega_z_err = metrics["yaw_rate"] - self.current_target_omega_z
+
+        sigma_v2 = max(cfg.sigma_track_v, 1e-9) ** 2
+        sigma_o2 = max(cfg.sigma_track_omega, 1e-9) ** 2
+
+        track_vx = cfg.w_track_vx * math.exp(-(vx_err**2) / sigma_v2)
+        track_vy = cfg.w_track_vy * math.exp(-(vy_err**2) / sigma_v2)
+        track_omega_z = cfg.w_track_omega_z * math.exp(-(omega_z_err**2) / sigma_o2)
+
+        target_vx = self.current_target_vx
+        if target_vx > 0.0:
+            progress_vx = cfg.w_progress_vx * max(
+                0.0, min(metrics["vx_body"], target_vx)
+            )
+        elif target_vx < 0.0:
+            progress_vx = cfg.w_progress_vx * min(
+                0.0, max(metrics["vx_body"], target_vx)
+            )
+        else:
+            progress_vx = 0.0
+
+        yaw_err = wrap_angle_rad(metrics["yaw"] - cfg.target_yaw)
+        sigma_h2 = max(cfg.sigma_heading_alignment, 1e-9) ** 2
+        heading_alignment_reward = cfg.w_heading_alignment * math.exp(
+            -(yaw_err**2) / sigma_h2
+        )
+
+        initial_y = (
+            self.episode_initial_y
+            if self.episode_initial_y is not None
+            else metrics["y"]
+        )
+        y_error = metrics["y"] - initial_y
+        clipped_y_error = float(
+            np.clip(y_error, -cfg.lateral_position_clip, cfg.lateral_position_clip)
+        )
+        lateral_position_pen = -cfg.w_lateral_position * clipped_y_error**2
+
+        lin_vel_z_pen = -cfg.w_lin_vel_z * metrics["vz"] ** 2
+        ang_vel_xy_pen = -cfg.w_ang_vel_xy * (
+            metrics["roll_rate"] ** 2 + metrics["pitch_rate"] ** 2
+        )
+        orientation_pen = -cfg.w_orientation * (
+            metrics["roll"] ** 2 + metrics["pitch"] ** 2
+        )
+        height_err = metrics["z"] - cfg.target_height
+        base_height_pen = -cfg.w_base_height * height_err**2
+
+        action_rate = action - self.prev_action
+        action_accel = action - 2.0 * self.prev_action + self.prev_prev_action
+        action_rate_pen = -cfg.w_action_rate * float(np.sum(action_rate * action_rate))
+        action_accel_pen = -cfg.w_action_accel * float(
+            np.sum(action_accel * action_accel)
+        )
+        action_energy_pen = -cfg.w_action_energy * float(np.sum(action * action))
+
+        qvel = np.asarray(self.unwrapped.data.qvel, dtype=np.float64)
+        dof_vel = qvel[6:]
+        dof_vel_pen = -cfg.w_dof_vel * float(np.sum(dof_vel * dof_vel))
+
+        return {
+            "alive": cfg.w_alive if not terminated else 0.0,
+            "track_vx": track_vx,
+            "track_vy": track_vy,
+            "track_omega_z": track_omega_z,
+            "progress_vx": progress_vx,
+            "heading_alignment": heading_alignment_reward,
+            "lateral_position": lateral_position_pen,
+            "lin_vel_z": lin_vel_z_pen,
+            "ang_vel_xy": ang_vel_xy_pen,
+            "orientation": orientation_pen,
+            "base_height": base_height_pen,
+            "action_rate": action_rate_pen,
+            "action_accel": action_accel_pen,
+            "action_energy": action_energy_pen,
+            "dof_vel": dof_vel_pen,
+        }
+
+    def compute_metrics(self) -> dict[str, float]:
+        qpos = np.asarray(self.unwrapped.data.qpos, dtype=np.float64)
+        qvel = np.asarray(self.unwrapped.data.qvel, dtype=np.float64)
+
+        roll, pitch, yaw = quat_wxyz_to_rpy(qpos[3:7])
+        vx_world = float(qvel[0])
+        vy_world = float(qvel[1])
+
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        vx_body = cos_yaw * vx_world + sin_yaw * vy_world
+        vy_body = -sin_yaw * vx_world + cos_yaw * vy_world
+
+        return {
+            "x": float(qpos[0]),
+            "y": float(qpos[1]),
+            "z": float(qpos[2]),
+            "roll": roll,
+            "pitch": pitch,
+            "yaw": yaw,
+            "vx": vx_world,
+            "vy": vy_world,
+            "vz": float(qvel[2]),
+            "vx_body": float(vx_body),
+            "vy_body": float(vy_body),
+            "roll_rate": float(qvel[3]),
+            "pitch_rate": float(qvel[4]),
+            "yaw_rate": float(qvel[5]),
+            "heading_alignment": cos_yaw,
+            "target_vx": float(self.current_target_vx),
+            "target_vy": float(self.current_target_vy),
+            "target_omega_z": float(self.current_target_omega_z),
+        }
+
+    def _normalize_velocity(self, v: float) -> float:
+        scale = max(self.cfg.velocity_obs_scale, 1e-9)
+        return float(np.clip(v / scale, -1.0, 1.0))
+
+    def _sample_command(self) -> None:
+        if not self.cfg.randomize_commands:
+            self.current_target_vx = self.cfg.target_forward_velocity
+            self.current_target_vy = self.cfg.target_lateral_velocity
+            self.current_target_omega_z = self.cfg.target_yaw_rate
+            return
+
+        rng = self.unwrapped.np_random
+        self.current_target_vx = float(
+            rng.uniform(
+                self.cfg.command_forward_velocity_min,
+                self.cfg.command_forward_velocity_max,
+            )
+        )
+        self.current_target_vy = float(
+            rng.uniform(
+                self.cfg.command_lateral_velocity_min,
+                self.cfg.command_lateral_velocity_max,
+            )
+        )
+        self.current_target_omega_z = float(
+            rng.uniform(
+                self.cfg.command_yaw_rate_min,
+                self.cfg.command_yaw_rate_max,
+            )
+        )

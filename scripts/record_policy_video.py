@@ -20,6 +20,8 @@ from stable_directional_ant import (
     ControlledLocomotionAntWrapper,
     ControlledLocomotionRewardConfig,
     LateralErrorObservationWrapper,
+    WellTrainedLocomotionAntWrapper,
+    WellTrainedLocomotionRewardConfig,
 )
 
 
@@ -46,6 +48,13 @@ def main() -> None:
     parser.add_argument("--controlled-target-velocity-obs-scale", type=float, default=3.0)
     parser.add_argument("--controlled-target-yaw-rate-obs-scale", type=float, default=2.0)
     parser.add_argument("--controlled-include-command-observation", action="store_true")
+    parser.add_argument("--use-well-trained-wrapper", action="store_true")
+    parser.add_argument("--well-trained-target-forward-velocity", type=float, default=2.0)
+    parser.add_argument("--well-trained-target-lateral-velocity", type=float, default=0.0)
+    parser.add_argument("--well-trained-target-yaw-rate", type=float, default=0.0)
+    parser.add_argument("--well-trained-target-height", type=float, default=0.53)
+    parser.add_argument("--well-trained-velocity-obs-scale", type=float, default=3.0)
+    parser.add_argument("--well-trained-include-command-observation", action="store_true")
     args = parser.parse_args()
 
     torch.set_num_threads(1)
@@ -54,7 +63,19 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     env = gym.make("Ant-v5", render_mode="rgb_array")
-    if args.use_controlled_locomotion_wrapper:
+    if args.use_well_trained_wrapper:
+        env = WellTrainedLocomotionAntWrapper(
+            env,
+            reward_config=WellTrainedLocomotionRewardConfig(
+                target_forward_velocity=args.well_trained_target_forward_velocity,
+                target_lateral_velocity=args.well_trained_target_lateral_velocity,
+                target_yaw_rate=args.well_trained_target_yaw_rate,
+                target_height=args.well_trained_target_height,
+                velocity_obs_scale=args.well_trained_velocity_obs_scale,
+                include_command_observation=args.well_trained_include_command_observation,
+            ),
+        )
+    elif args.use_controlled_locomotion_wrapper:
         env = ControlledLocomotionAntWrapper(
             env,
             reward_config=ControlledLocomotionRewardConfig(

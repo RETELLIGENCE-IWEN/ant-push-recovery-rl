@@ -23,6 +23,8 @@ from stable_directional_ant import (
     ControlledLocomotionAntWrapper,
     ControlledLocomotionRewardConfig,
     LateralErrorObservationWrapper,
+    WellTrainedLocomotionAntWrapper,
+    WellTrainedLocomotionRewardConfig,
 )
 
 
@@ -58,6 +60,15 @@ def get_root_state(env: gym.Env) -> dict[str, float]:
 
     roll, pitch, yaw = quat_wxyz_to_rpy(qpos[3:7])
 
+    vx_world = float(qvel[0])
+    vy_world = float(qvel[1])
+    cos_yaw = math.cos(yaw)
+    sin_yaw = math.sin(yaw)
+    vx_body = cos_yaw * vx_world + sin_yaw * vy_world
+    vy_body = -sin_yaw * vx_world + cos_yaw * vy_world
+
+    dof_vel = qvel[6:].copy()
+
     return {
         "x": x,
         "y": y,
@@ -65,12 +76,15 @@ def get_root_state(env: gym.Env) -> dict[str, float]:
         "roll": roll,
         "pitch": pitch,
         "yaw": yaw,
-        "vx": float(qvel[0]),
-        "vy": float(qvel[1]),
+        "vx": vx_world,
+        "vy": vy_world,
         "vz": float(qvel[2]),
+        "vx_body": float(vx_body),
+        "vy_body": float(vy_body),
         "roll_rate": float(qvel[3]),
         "pitch_rate": float(qvel[4]),
         "yaw_rate": float(qvel[5]),
+        "dof_vel_sq_sum": float(np.sum(dof_vel * dof_vel)),
     }
 
 
@@ -96,9 +110,16 @@ def evaluate_episode(
     lateral_error_observation_clip: float,
     use_controlled_locomotion_wrapper: bool,
     controlled_reward_config: ControlledLocomotionRewardConfig,
+    use_well_trained_wrapper: bool,
+    well_trained_reward_config: WellTrainedLocomotionRewardConfig,
 ) -> dict:
     env = gym.make("Ant-v5")
-    if use_controlled_locomotion_wrapper:
+    if use_well_trained_wrapper:
+        env = WellTrainedLocomotionAntWrapper(
+            env,
+            reward_config=well_trained_reward_config,
+        )
+    elif use_controlled_locomotion_wrapper:
         env = ControlledLocomotionAntWrapper(
             env,
             reward_config=controlled_reward_config,
@@ -131,15 +152,28 @@ def evaluate_episode(
 
     roll_sq_sum = 0.0
     pitch_sq_sum = 0.0
+    roll_rate_sq_sum = 0.0
+    pitch_rate_sq_sum = 0.0
     vertical_velocity_sq_sum = 0.0
     lateral_velocity_abs_sum = 0.0
     lateral_velocity_sq_sum = 0.0
+
+    vx_body_sum = 0.0
+    vy_body_abs_sum = 0.0
+    vy_body_sq_sum = 0.0
+    vx_body_err_sq_sum = 0.0
+    dof_vel_sq_sum = 0.0
 
     heights: list[float] = []
 
     dt = float(env.unwrapped.dt)
     target_course_yaw = 0.0
-    if use_controlled_locomotion_wrapper:
+    target_vx_body = 0.0
+    target_vy_body = 0.0
+    if use_well_trained_wrapper:
+        target_vx_body = well_trained_reward_config.target_forward_velocity
+        target_vy_body = well_trained_reward_config.target_lateral_velocity
+    elif use_controlled_locomotion_wrapper:
         command_speed = math.hypot(
             controlled_reward_config.target_forward_velocity,
             controlled_reward_config.target_lateral_velocity,
@@ -185,9 +219,17 @@ def evaluate_episode(
 
         roll_sq_sum += state["roll"] ** 2
         pitch_sq_sum += state["pitch"] ** 2
+        roll_rate_sq_sum += state["roll_rate"] ** 2
+        pitch_rate_sq_sum += state["pitch_rate"] ** 2
         vertical_velocity_sq_sum += state["vz"] ** 2
         lateral_velocity_abs_sum += abs(state["vy"])
         lateral_velocity_sq_sum += state["vy"] ** 2
+
+        vx_body_sum += state["vx_body"]
+        vy_body_abs_sum += abs(state["vy_body"])
+        vy_body_sq_sum += state["vy_body"] ** 2
+        vx_body_err_sq_sum += (state["vx_body"] - target_vx_body) ** 2
+        dof_vel_sq_sum += state["dof_vel_sq_sum"]
 
         heights.append(state["z"])
 
@@ -231,9 +273,17 @@ def evaluate_episode(
 
         "roll_rms": math.sqrt(roll_sq_sum / max(steps, 1)),
         "pitch_rms": math.sqrt(pitch_sq_sum / max(steps, 1)),
+        "roll_rate_rms": math.sqrt(roll_rate_sq_sum / max(steps, 1)),
+        "pitch_rate_rms": math.sqrt(pitch_rate_sq_sum / max(steps, 1)),
         "height_mean": height_mean,
         "height_std": height_std,
         "vertical_velocity_rms": math.sqrt(vertical_velocity_sq_sum / max(steps, 1)),
+
+        "vx_body_mean": vx_body_sum / max(steps, 1),
+        "vx_body_err_rms": math.sqrt(vx_body_err_sq_sum / max(steps, 1)),
+        "vy_body_mean_abs": vy_body_abs_sum / max(steps, 1),
+        "vy_body_rms": math.sqrt(vy_body_sq_sum / max(steps, 1)),
+        "dof_vel_rms": math.sqrt(dof_vel_sq_sum / max(steps, 1)),
 
         "mean_action_norm": action_norm_sum / max(steps, 1),
         "mean_action_energy": action_energy_sum / max(steps, 1),
@@ -260,6 +310,13 @@ def main() -> None:
     parser.add_argument("--controlled-target-velocity-obs-scale", type=float, default=3.0)
     parser.add_argument("--controlled-target-yaw-rate-obs-scale", type=float, default=2.0)
     parser.add_argument("--controlled-include-command-observation", action="store_true")
+    parser.add_argument("--use-well-trained-wrapper", action="store_true")
+    parser.add_argument("--well-trained-target-forward-velocity", type=float, default=2.0)
+    parser.add_argument("--well-trained-target-lateral-velocity", type=float, default=0.0)
+    parser.add_argument("--well-trained-target-yaw-rate", type=float, default=0.0)
+    parser.add_argument("--well-trained-target-height", type=float, default=0.53)
+    parser.add_argument("--well-trained-velocity-obs-scale", type=float, default=3.0)
+    parser.add_argument("--well-trained-include-command-observation", action="store_true")
     args = parser.parse_args()
 
     torch.set_num_threads(1)
@@ -279,6 +336,14 @@ def main() -> None:
         lateral_position_clip=args.lateral_error_observation_clip,
         include_command_observation=args.controlled_include_command_observation,
     )
+    well_trained_reward_config = WellTrainedLocomotionRewardConfig(
+        target_forward_velocity=args.well_trained_target_forward_velocity,
+        target_lateral_velocity=args.well_trained_target_lateral_velocity,
+        target_yaw_rate=args.well_trained_target_yaw_rate,
+        target_height=args.well_trained_target_height,
+        velocity_obs_scale=args.well_trained_velocity_obs_scale,
+        include_command_observation=args.well_trained_include_command_observation,
+    )
 
     rows = []
     for i in range(args.episodes):
@@ -292,17 +357,20 @@ def main() -> None:
             lateral_error_observation_clip=args.lateral_error_observation_clip,
             use_controlled_locomotion_wrapper=args.use_controlled_locomotion_wrapper,
             controlled_reward_config=controlled_reward_config,
+            use_well_trained_wrapper=args.use_well_trained_wrapper,
+            well_trained_reward_config=well_trained_reward_config,
         )
         rows.append(row)
 
         print(
             f"[eval-metrics] ep={i:03d} seed={ep_seed} "
             f"return={row['return']:.1f} "
-            f"dist_x={row['distance_x']:.2f} "
-            f"vel={row['mean_forward_velocity']:.2f} "
+            f"vx_body={row['vx_body_mean']:.2f} "
+            f"vy_body_abs={row['vy_body_mean_abs']:.3f} "
             f"yaw_abs={row['yaw_abs_mean']:.3f} "
-            f"course={row['course_alignment_mean']:.3f} "
-            f"height_std={row['height_std']:.3f} "
+            f"drift={row['abs_lateral_drift']:.2f} "
+            f"h_std={row['height_std']:.3f} "
+            f"act_dr={row['action_delta_rms']:.3f} "
             f"survived={row['survived_to_max_steps']}"
         )
 
@@ -331,6 +399,11 @@ def main() -> None:
         "controlled_target_forward_velocity": args.controlled_target_forward_velocity,
         "controlled_target_yaw": args.controlled_target_yaw,
         "controlled_target_height": args.controlled_target_height,
+        "use_well_trained_wrapper": args.use_well_trained_wrapper,
+        "well_trained_target_forward_velocity": args.well_trained_target_forward_velocity,
+        "well_trained_target_lateral_velocity": args.well_trained_target_lateral_velocity,
+        "well_trained_target_yaw_rate": args.well_trained_target_yaw_rate,
+        "well_trained_target_height": args.well_trained_target_height,
         "survival_rate": sum(r["survived_to_max_steps"] for r in rows) / len(rows),
         "termination_rate": sum(r["terminated"] for r in rows) / len(rows),
     }
