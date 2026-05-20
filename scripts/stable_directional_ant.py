@@ -1033,3 +1033,291 @@ class WellTrainedLocomotionAntWrapper(gym.Wrapper):
                 self.cfg.command_yaw_rate_max,
             )
         )
+
+
+@dataclass(frozen=True)
+class PushDisturbanceConfig:
+    """
+    External push disturbance applied to the torso during training.
+
+    The wrapper applies a force F (N) to the torso body in a random xy
+    direction for `push_duration_steps` MuJoCo sub-steps, then idles for
+    a sampled inter-push interval before the next event. The maximum force
+    magnitude ramps linearly with per-env step count (curriculum), which
+    avoids destabilising the warm-started locomotion policy at the start.
+    """
+
+    enabled: bool = True
+    torso_body_name: str = "torso"
+    push_force_max: float = 10.0      # N, at end of curriculum
+    push_duration_steps: int = 5       # MuJoCo sub-steps push is held
+    push_interval_steps_min: int = 500   # min steps between pushes (5s @ 100Hz)
+    push_interval_steps_max: int = 1000  # max steps between pushes (10s @ 100Hz)
+    curriculum_ramp_steps: int = 300_000  # per-env steps to reach push_force_max
+    initial_quiet_steps: int = 10_000     # warm-up: no pushes for first N env steps
+
+
+class PushDisturbanceWrapper(gym.Wrapper):
+    """
+    Apply random xy push forces to the Ant torso during step().
+
+    Schedule per env:
+      - Starts in `initial_quiet_steps` quiet phase (no pushes).
+      - Then every push_interval_steps in [min,max] uniform, a new push is
+        scheduled with magnitude sampled from [0, current_max] (random xy dir).
+      - The push is applied for push_duration_steps consecutive sim steps via
+        data.xfrc_applied[torso_id, :3].
+      - current_max ramps linearly from 0 to push_force_max across
+        curriculum_ramp_steps (counted in env steps, persistent across resets).
+
+    Observation: unchanged. The policy must react via proprioception.
+    Reward: unchanged.
+    Info: adds push_force_magnitude, push_force_dir_x, push_force_dir_y
+    so eval scripts can attribute disturbances.
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        config: PushDisturbanceConfig | None = None,
+    ):
+        super().__init__(env)
+        self.cfg = config or PushDisturbanceConfig()
+
+        model = self.unwrapped.model
+        torso_id = None
+        for i in range(model.nbody):
+            if model.body(i).name == self.cfg.torso_body_name:
+                torso_id = i
+                break
+        if torso_id is None:
+            raise ValueError(
+                f"Body '{self.cfg.torso_body_name}' not found in MuJoCo model."
+            )
+        self._torso_id = torso_id
+
+        # Persistent step counter across resets (per-env, since each env
+        # has its own wrapper instance under VecEnv).
+        self._env_step_count = 0
+
+        # Scheduling state (reset each episode)
+        self._next_push_step = 0
+        self._push_remaining_steps = 0
+        self._current_force_xy = np.zeros(2, dtype=np.float64)
+        self._current_force_magnitude = 0.0
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        # Clear any residual force at episode start
+        self.unwrapped.data.xfrc_applied[self._torso_id, :] = 0.0
+        # Schedule the first push relative to the start of this episode
+        self._next_push_step = self._env_step_count + self._sample_interval()
+        self._push_remaining_steps = 0
+        self._current_force_xy[:] = 0.0
+        self._current_force_magnitude = 0.0
+        return obs, info
+
+    def step(self, action):
+        if self.cfg.enabled:
+            self._maybe_start_push()
+            self._apply_active_force()
+        else:
+            self.unwrapped.data.xfrc_applied[self._torso_id, :] = 0.0
+
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        info = dict(info)
+        info["push_force_magnitude"] = float(self._current_force_magnitude)
+        info["push_force_dir_x"] = float(self._current_force_xy[0] / max(self._current_force_magnitude, 1e-9))
+        info["push_force_dir_y"] = float(self._current_force_xy[1] / max(self._current_force_magnitude, 1e-9))
+        info["push_curriculum_force_max"] = float(self._current_max_force())
+
+        self._env_step_count += 1
+        if self._push_remaining_steps > 0:
+            self._push_remaining_steps -= 1
+            if self._push_remaining_steps == 0:
+                self.unwrapped.data.xfrc_applied[self._torso_id, :] = 0.0
+                self._current_force_magnitude = 0.0
+                self._current_force_xy[:] = 0.0
+                self._next_push_step = self._env_step_count + self._sample_interval()
+
+        return obs, reward, terminated, truncated, info
+
+    def _current_max_force(self) -> float:
+        cfg = self.cfg
+        if self._env_step_count < cfg.initial_quiet_steps:
+            return 0.0
+        progress = (self._env_step_count - cfg.initial_quiet_steps) / max(
+            cfg.curriculum_ramp_steps, 1
+        )
+        progress = float(np.clip(progress, 0.0, 1.0))
+        return cfg.push_force_max * progress
+
+    def _sample_interval(self) -> int:
+        rng = self.unwrapped.np_random
+        return int(
+            rng.integers(
+                self.cfg.push_interval_steps_min,
+                self.cfg.push_interval_steps_max + 1,
+            )
+        )
+
+    def _maybe_start_push(self) -> None:
+        if self._push_remaining_steps > 0:
+            return
+        if self._env_step_count < self._next_push_step:
+            return
+
+        max_f = self._current_max_force()
+        if max_f <= 0.0:
+            self._next_push_step = self._env_step_count + self._sample_interval()
+            return
+
+        rng = self.unwrapped.np_random
+        theta = float(rng.uniform(0.0, 2.0 * math.pi))
+        magnitude = float(rng.uniform(0.0, max_f))
+        self._current_force_xy[0] = magnitude * math.cos(theta)
+        self._current_force_xy[1] = magnitude * math.sin(theta)
+        self._current_force_magnitude = magnitude
+        self._push_remaining_steps = self.cfg.push_duration_steps
+
+    def _apply_active_force(self) -> None:
+        if self._push_remaining_steps > 0:
+            xfrc = self.unwrapped.data.xfrc_applied
+            xfrc[self._torso_id, 0] = self._current_force_xy[0]
+            xfrc[self._torso_id, 1] = self._current_force_xy[1]
+            xfrc[self._torso_id, 2] = 0.0
+        else:
+            self.unwrapped.data.xfrc_applied[self._torso_id, :] = 0.0
+
+
+@dataclass(frozen=True)
+class DomainRandomizationConfig:
+    """
+    Per-episode randomization of dynamics + per-step action noise.
+
+    Scales are sampled at every reset and applied multiplicatively to the
+    original MuJoCo model parameters (which are restored from a snapshot
+    captured at wrapper construction). Action noise is additive Gaussian
+    in the [-1, 1] normalized action space.
+    """
+
+    enabled: bool = True
+    torso_body_name: str = "torso"
+
+    mass_scale_min: float = 0.8
+    mass_scale_max: float = 1.2
+    friction_scale_min: float = 0.5
+    friction_scale_max: float = 1.5
+    damping_scale_min: float = 0.8
+    damping_scale_max: float = 1.2
+    motor_scale_min: float = 0.85
+    motor_scale_max: float = 1.15
+    action_noise_std: float = 0.02
+
+
+class DomainRandomizationWrapper(gym.Wrapper):
+    """
+    Randomize torso mass, geom friction, joint damping, motor gain, and inject
+    action noise. Originals are snapshotted at construction and restored before
+    each new scaling is applied.
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        config: DomainRandomizationConfig | None = None,
+    ):
+        super().__init__(env)
+        self.cfg = config or DomainRandomizationConfig()
+
+        model = self.unwrapped.model
+
+        torso_id = None
+        for i in range(model.nbody):
+            if model.body(i).name == self.cfg.torso_body_name:
+                torso_id = i
+                break
+        if torso_id is None:
+            raise ValueError(
+                f"Body '{self.cfg.torso_body_name}' not found in MuJoCo model."
+            )
+        self._torso_id = torso_id
+
+        self._original_torso_mass = float(model.body_mass[torso_id])
+        self._original_geom_friction = np.array(model.geom_friction, copy=True)
+        self._original_dof_damping = np.array(model.dof_damping, copy=True)
+        # actuator_gainprm has shape (n_actuators, n_params); the first column
+        # is the gain (proportional to motor strength) for affine actuators.
+        self._original_actuator_gainprm = np.array(model.actuator_gainprm, copy=True)
+
+        self._current_motor_scale = 1.0
+        self._current_mass_scale = 1.0
+        self._current_friction_scale = 1.0
+        self._current_damping_scale = 1.0
+
+    def reset(self, **kwargs):
+        if self.cfg.enabled:
+            self._sample_and_apply_dynamics()
+        else:
+            self._restore_originals()
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        if self.cfg.enabled and self.cfg.action_noise_std > 0.0:
+            rng = self.unwrapped.np_random
+            noise = rng.normal(0.0, self.cfg.action_noise_std, size=action.shape)
+            action = np.clip(
+                np.asarray(action, dtype=np.float64) + noise,
+                self.action_space.low,
+                self.action_space.high,
+            )
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        info = dict(info)
+        info["dr_mass_scale"] = float(self._current_mass_scale)
+        info["dr_friction_scale"] = float(self._current_friction_scale)
+        info["dr_damping_scale"] = float(self._current_damping_scale)
+        info["dr_motor_scale"] = float(self._current_motor_scale)
+        return obs, reward, terminated, truncated, info
+
+    def _sample_and_apply_dynamics(self) -> None:
+        rng = self.unwrapped.np_random
+        cfg = self.cfg
+        model = self.unwrapped.model
+
+        self._current_mass_scale = float(
+            rng.uniform(cfg.mass_scale_min, cfg.mass_scale_max)
+        )
+        self._current_friction_scale = float(
+            rng.uniform(cfg.friction_scale_min, cfg.friction_scale_max)
+        )
+        self._current_damping_scale = float(
+            rng.uniform(cfg.damping_scale_min, cfg.damping_scale_max)
+        )
+        self._current_motor_scale = float(
+            rng.uniform(cfg.motor_scale_min, cfg.motor_scale_max)
+        )
+
+        model.body_mass[self._torso_id] = (
+            self._original_torso_mass * self._current_mass_scale
+        )
+        model.geom_friction[:] = (
+            self._original_geom_friction * self._current_friction_scale
+        )
+        model.dof_damping[:] = (
+            self._original_dof_damping * self._current_damping_scale
+        )
+        model.actuator_gainprm[:] = (
+            self._original_actuator_gainprm * self._current_motor_scale
+        )
+
+    def _restore_originals(self) -> None:
+        model = self.unwrapped.model
+        model.body_mass[self._torso_id] = self._original_torso_mass
+        model.geom_friction[:] = self._original_geom_friction
+        model.dof_damping[:] = self._original_dof_damping
+        model.actuator_gainprm[:] = self._original_actuator_gainprm
+        self._current_mass_scale = 1.0
+        self._current_friction_scale = 1.0
+        self._current_damping_scale = 1.0
+        self._current_motor_scale = 1.0
