@@ -390,6 +390,12 @@ def main():
     parser.add_argument("--tier-a-episodes", type=int, default=10)
     parser.add_argument("--tier-b-episodes", type=int, default=3)
     parser.add_argument("--tier-c-episodes", type=int, default=10)
+    parser.add_argument(
+        "--tier-b-magnitudes",
+        type=str,
+        default="2,4,6,8,10",
+        help="Comma-separated push magnitudes in N for Tier B grid.",
+    )
     args = parser.parse_args()
 
     torch.set_num_threads(1)
@@ -402,10 +408,11 @@ def main():
     if "a" in args.tiers:
         summaries["A"] = tier_a_quiet(model, out_dir, args.tier_a_episodes)
     if "b" in args.tiers:
+        magnitudes = [float(x) for x in args.tier_b_magnitudes.split(",")]
         summaries["B"] = tier_b_push_grid(
             model,
             out_dir,
-            magnitudes=[2.0, 4.0, 6.0, 8.0, 10.0],
+            magnitudes=magnitudes,
             directions_deg=[0, 45, 90, 135, 180, 225, 270, 315],
             push_at_step=250,
             push_duration=5,
