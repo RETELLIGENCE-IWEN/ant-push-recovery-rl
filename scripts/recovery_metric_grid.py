@@ -35,6 +35,7 @@ import torch
 from stable_baselines3 import PPO
 
 from stable_directional_ant import (
+    ObservationHistoryStackWrapper,
     WellTrainedLocomotionAntWrapper,
     WellTrainedLocomotionRewardConfig,
     quat_wxyz_to_rpy,
@@ -82,9 +83,12 @@ def run_episode(
     vx_tol: float = 0.4,
     yaw_tol: float = 0.25,
     wz_tol: float = 0.6,
+    history_stack_size: int = 1,
 ) -> dict:
     env = gym.make("Ant-v5")
     env = WellTrainedLocomotionAntWrapper(env, reward_config=WellTrainedLocomotionRewardConfig())
+    if history_stack_size > 1:
+        env = ObservationHistoryStackWrapper(env, stack_size=history_stack_size)
     torso_id = get_torso_id(env)
 
     obs, info = env.reset(seed=seed)
@@ -192,6 +196,11 @@ def main():
     p.add_argument("--push-step", type=int, default=250)
     p.add_argument("--push-duration", type=int, default=30)
     p.add_argument("--target-vx", type=float, default=2.0)
+    p.add_argument("--history-stack-size", type=int, default=1,
+                   help="If >1, stack last N observations to match training-time obs space.")
+    p.add_argument("--per-model-history-sizes", type=str, default="",
+                   help="Optional: comma-separated history sizes per model (same order as --models). "
+                        "Overrides --history-stack-size when set.")
     args = p.parse_args()
 
     torch.set_num_threads(1)
@@ -206,9 +215,16 @@ def main():
     print(f"[E2] forces={forces} dirs={directions} torque={args.torque_z}")
     print(f"[E2] episodes/cell={args.episodes_per_cell}")
 
+    per_model_history = {}
+    if args.per_model_history_sizes:
+        sizes = [int(s) for s in args.per_model_history_sizes.split(",")]
+        for (label, _), sz in zip(model_entries, sizes):
+            per_model_history[label] = sz
+
     rows = []
     for label, model_path in model_entries:
-        print(f"\n=== {label} ({model_path}) ===")
+        hs = per_model_history.get(label, args.history_stack_size)
+        print(f"\n=== {label} ({model_path}) [history_stack={hs}] ===")
         model = PPO.load(model_path, device="cpu")
         for force in forces:
             for d_deg in directions:
@@ -228,6 +244,7 @@ def main():
                         force_xy=force_xy,
                         torque_z=torque_z,
                         target_vx=args.target_vx,
+                        history_stack_size=hs,
                     )
                     row["policy"] = label
                     row["direction_deg"] = d_deg

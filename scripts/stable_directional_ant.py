@@ -1477,3 +1477,66 @@ class DomainRandomizationWrapper(gym.Wrapper):
         self._current_friction_scale = 1.0
         self._current_damping_scale = 1.0
         self._current_motor_scale = 1.0
+
+
+class ObservationHistoryStackWrapper(gym.Wrapper):
+    """
+    Stack the last N observations as a single flat vector.
+
+    Layout is **newest-first**: [obs_t, obs_{t-1}, ..., obs_{t-N+1}]. This means
+    the first inner_dim entries of the policy input are always the current
+    observation, which (a) matches the policy's interpretation in a no-stack
+    setting and (b) makes input-expansion warm-starts from a single-frame
+    policy correct: copying source weights into the leading inner_dim columns
+    of the policy's first layer puts source weights on the *current* obs.
+
+    With stack_size=1 this wrapper is a no-op.
+
+    On reset the buffer is filled with the initial observation N times so the
+    very first step's history is self-consistent.
+    """
+
+    def __init__(self, env: gym.Env, stack_size: int = 1):
+        super().__init__(env)
+        if not isinstance(env.observation_space, spaces.Box):
+            raise TypeError("ObservationHistoryStackWrapper requires a Box observation.")
+        if stack_size < 1:
+            raise ValueError("stack_size must be >= 1.")
+
+        self.stack_size = int(stack_size)
+        inner_low = np.asarray(env.observation_space.low, dtype=np.float32)
+        inner_high = np.asarray(env.observation_space.high, dtype=np.float32)
+        self._inner_dim = int(inner_low.shape[0])
+
+        low = np.tile(inner_low, self.stack_size)
+        high = np.tile(inner_high, self.stack_size)
+        self.observation_space = spaces.Box(
+            low=low,
+            high=high,
+            dtype=env.observation_space.dtype,
+        )
+
+        # Row 0 holds the newest observation; row N-1 the oldest.
+        self._buffer = np.zeros(
+            (self.stack_size, self._inner_dim),
+            dtype=env.observation_space.dtype,
+        )
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        obs_arr = np.asarray(obs, dtype=self.observation_space.dtype)
+        for i in range(self.stack_size):
+            self._buffer[i, :] = obs_arr
+        return self._flatten_buffer(), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        obs_arr = np.asarray(obs, dtype=self.observation_space.dtype)
+        # Shift older entries one slot back; place newest at row 0.
+        self._buffer[1:, :] = self._buffer[:-1, :]
+        self._buffer[0, :] = obs_arr
+        return self._flatten_buffer(), reward, terminated, truncated, info
+
+    def _flatten_buffer(self) -> np.ndarray:
+        # Returns [newest, ..., oldest] concatenated.
+        return self._buffer.reshape(-1).copy()

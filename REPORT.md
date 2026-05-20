@@ -189,6 +189,50 @@ Tier A (quiet): v4d survival 1.0, vx 1.75, yaw 0.10 — v4b와 동등. 다만 no
 - **정책 ceiling은 아직 partial observability가 깨지 않은 영역**: history-stack / RecurrentPPO / RMA-lite 가 다음 후보.
 - **알고리즘 (PPO → SAC) 변경은 여전히 후순위**: 위 1-2개를 더 시도하기 전엔 SAC 도입은 원인 분리만 어렵게 함.
 
+## 5.9 E4 — v5a: History Stack 으로 Partial Observability 검증
+
+E3 v4d 의 cross-direction inconsistency 가 partial observability 때문이라는 가설을 직접 검증. 정책 입력에 최근 5 frame (0.05s) proprio history 추가.
+
+**구현**:
+- `ObservationHistoryStackWrapper`: 5 frame 저장, layout `[newest, ..., oldest]` (newest-first).
+- `train_robust_locomotion.py`에 `--warm-start-on-observation-mismatch` 모드 추가. v4d (obs 117) 의 weights 를 v5a (obs 585) 의 *앞 117 cols* 에 복사 + 나머지 zero-init → warm-start 초기엔 v4d 와 동일한 mean action (현재 obs 만 사용).
+
+**디버깅 노트**: 첫 시도 (v5a v1) 는 wrapper layout 이 oldest-first 였고 warm-start expansion 이 첫 cols (= oldest frame) 에 v4d weights 를 복사 → 정책이 4-step 지연된 obs 만 보고 학습 → catastrophic failure (Tier A vx 0.28, return -2508). Layout 을 newest-first 로 수정한 v5a v2 가 정상 학습.
+
+**Training**: v4d warm-start, learning_rate 5e-5 (보수적), 동일 reward + boundary push curriculum, 1M steps.
+
+**결과** (`reports/recovery_metric_grid_v5a_v2.csv`):
+
+| F (dir) | v4d surv | v5a_v2 surv | Δ |
+|---|---|---|---|
+| 5N (all 4) | 100% | 100% | = |
+| 10N 0° | 100% | 100% | = |
+| **10N 180°** | **0%** | **50%** | **+50%** |
+| 10N 270° | 75% | 100% | +25% |
+| **10N avg** | **69%** | **88%** | **+19%** |
+| 15N 0° | 75% | 0% | -75% |
+| 15N 90° | 50% | 100% | +50% |
+| 15N 180° | 25% | 25% | = |
+| 15N 270° | 25% | 25% | = |
+| 15N avg | 44% | 38% | -6% |
+
+Recovery time 도 개선: 10N dir=90° 132 → 55 steps (2.4× 빨라짐).
+
+Tier A: survival 1.0, vx 1.78, drift 4.06m, yaw 0.094 — nominal locomotion 유지 (drift 약간 증가).
+
+**해석**:
+- **10N 영역에서 partial observability 가설 명확히 검증됨**: v4d 가 0% 였던 10N dir=180° (backward push) 가 v5a_v2 에서 50% 까지 회복. cross-direction 일관성 개선이 history stack 의 직접 효과로 보임.
+- **15N 영역에선 trade-off**: 90° lateral 50%→100% 큰 개선이지만 0° forward 75%→0% 회귀. 이는 partial observability 만으로 설명 안 되며, 학습 budget 부족 또는 stack size 5 (0.05s) 가 30-step push 의 full pattern 을 담기엔 너무 짧을 가능성. stack=20-30 또는 RecurrentPPO 가 다음 후보.
+- **실패 사례 (v5a v1) 가 더 큰 교훈**: warm-start expansion 의 layout 가정을 wrapper 와 정확히 맞추지 않으면 정책 catastrophic failure. observation augmentation 류 작업에선 항상 layout convention 을 명시적으로 정의해야 함.
+
+## 5.10 잠정 결론 update
+
+E1-E4 cycle 후:
+
+- **Partial observability 는 robustness ceiling 의 일부**, 그러나 *유일한* 요인은 아님 (15N forward 의 v5a_v2 회귀가 그 증거).
+- **History stack 5 는 mid-range disturbance (10N) 에 효과적**, hard regime (15N) 에는 부족.
+- 다음 단일 intervention 후보 (우선순위): (1) history stack 확장 (10-20 frame, push duration 의 1/3 이상) (2) RecurrentPPO (3) RMA-lite teacher-student.
+
 ## 6. Research Takeaways
 
 ### 6.1 작동한 design choice
@@ -244,6 +288,7 @@ v4c null result에서 즉시 "PPO 한계, SAC로 교체" 결론을 낼 뻔했음
 | 2 | [v4b](runs/robust_locomotion_v4b_stretch20N_seed42_1000k/) | `train_robust_locomotion.py` --push-force-max 20 |
 | 2b | [v4c](runs/robust_locomotion_v4c_stress_seed42_1000k/) | + `--push-torque-z-max 0.20 --push-duration-max-steps 30` |
 | 2c | [v4d](runs/robust_locomotion_v4d_boundary_recovery_seed42_1000k/) | + `--push-use-boundary-sampling --w-recovery-{vx,vy,yaw}-err 0.5 --w-recovery-roll-pitch 1.0 --w-recovery-yaw-rate 0.2` |
+| 2d | [v5a_v2](runs/robust_locomotion_v5a_history5_seed42_1000k_v2/) | + `--warm-start-on-observation-mismatch --history-stack-size 5 --learning-rate 5e-5` |
 
 평가:
 - Tier A/B/C standard grid: `eval_robust_locomotion.py --tiers abc`
@@ -256,6 +301,7 @@ v4c null result에서 즉시 "PPO 한계, SAC로 교체" 결론을 낼 뻔했음
 - Phase 2: `videos/phase2_v4b_quiet.mp4`, `videos/phase2_v4b_push20N_*.mp4`
 - Phase 2b: `videos/phase2b_v4b_stress_10N_lateral.mp4`, `videos/phase2b_v4c_stress_*.mp4`
 - Phase 2c (v4d): `videos/phase2c_v4d_quiet.mp4`, `videos/phase2c_v4d_stress_15N_*.mp4`
+- Phase 2d (v5a_v2): `videos/phase3_v5a_quiet.mp4`, `videos/phase3_v5a_stress_10N_180.mp4`, `videos/phase3_v5a_stress_15N_90.mp4`
 
 ## 9. Closing
 

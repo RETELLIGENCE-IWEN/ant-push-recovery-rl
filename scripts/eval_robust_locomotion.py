@@ -35,6 +35,7 @@ from stable_baselines3 import PPO
 from stable_directional_ant import (
     DomainRandomizationConfig,
     DomainRandomizationWrapper,
+    ObservationHistoryStackWrapper,
     PushDisturbanceConfig,
     PushDisturbanceWrapper,
     WellTrainedLocomotionAntWrapper,
@@ -76,7 +77,7 @@ def get_root_state(env: gym.Env) -> dict:
     }
 
 
-def build_eval_env(use_dr: bool, dr_action_noise: float) -> gym.Env:
+def build_eval_env(use_dr: bool, dr_action_noise: float, history_stack_size: int = 1) -> gym.Env:
     env = gym.make("Ant-v5")
     if use_dr:
         env = DomainRandomizationWrapper(
@@ -90,6 +91,8 @@ def build_eval_env(use_dr: bool, dr_action_noise: float) -> gym.Env:
         env,
         reward_config=WellTrainedLocomotionRewardConfig(),
     )
+    if history_stack_size > 1:
+        env = ObservationHistoryStackWrapper(env, stack_size=history_stack_size)
     return env
 
 
@@ -113,6 +116,7 @@ def run_episode(
     use_dr: bool,
     dr_action_noise: float,
     push_schedule: list[dict] | None,
+    history_stack_size: int = 1,
 ) -> dict:
     """
     push_schedule is a list of {"step_start": int, "duration": int,
@@ -120,7 +124,7 @@ def run_episode(
     Forces and torque applied to torso between [step_start, step_start+duration).
     "torque_z" is optional (default 0).
     """
-    env = build_eval_env(use_dr=use_dr, dr_action_noise=dr_action_noise)
+    env = build_eval_env(use_dr=use_dr, dr_action_noise=dr_action_noise, history_stack_size=history_stack_size)
     torso_id = get_torso_id(env)
 
     obs, info = env.reset(seed=seed)
@@ -227,7 +231,7 @@ def run_episode(
     }
 
 
-def tier_a_quiet(model: PPO, out_dir: Path, episodes: int = 10) -> dict:
+def tier_a_quiet(model: PPO, out_dir: Path, episodes: int = 10, history_stack_size: int = 1) -> dict:
     print("=== Tier A: Quiet eval (no push, no DR) ===")
     rows = []
     for i in range(episodes):
@@ -238,6 +242,7 @@ def tier_a_quiet(model: PPO, out_dir: Path, episodes: int = 10) -> dict:
             use_dr=False,
             dr_action_noise=0.0,
             push_schedule=None,
+            history_stack_size=history_stack_size,
         )
         rows.append(row)
         print(
@@ -272,6 +277,7 @@ def tier_b_push_grid(
     episodes_per_cell: int = 5,
     torque_z: float = 0.0,
     randomize_torque_sign: bool = False,
+    history_stack_size: int = 1,
 ) -> dict:
     label = f"Tier B: push at t={push_at_step*0.01:.1f}s, dur={push_duration*0.01:.2f}s"
     if torque_z != 0.0:
@@ -297,6 +303,7 @@ def tier_b_push_grid(
                         "force_xy": force_xy,
                         "torque_z": sign * torque_z,
                     }],
+                    history_stack_size=history_stack_size,
                 )
                 row["push_magnitude"] = mag
                 row["push_direction_deg"] = d_deg
@@ -334,7 +341,7 @@ def tier_b_push_grid(
     }
 
 
-def tier_c_random_push(model: PPO, out_dir: Path, episodes: int = 10) -> dict:
+def tier_c_random_push(model: PPO, out_dir: Path, episodes: int = 10, history_stack_size: int = 1) -> dict:
     print("=== Tier C: Random push + DR (training-like) ===")
     rows = []
     for i in range(episodes):
@@ -360,6 +367,8 @@ def tier_c_random_push(model: PPO, out_dir: Path, episodes: int = 10) -> dict:
             env,
             reward_config=WellTrainedLocomotionRewardConfig(),
         )
+        if history_stack_size > 1:
+            env = ObservationHistoryStackWrapper(env, stack_size=history_stack_size)
         obs, info = env.reset(seed=3000 + i)
         initial = get_root_state(env)
         total_r = 0.0
@@ -426,6 +435,10 @@ def main():
         "--tier-b-randomize-torque-sign", action="store_true",
         help="Alternate torque sign across episodes (covers both twist directions).",
     )
+    parser.add_argument(
+        "--history-stack-size", type=int, default=1,
+        help="Stack last N observations to match training-time obs space (1 = no stacking).",
+    )
     args = parser.parse_args()
 
     torch.set_num_threads(1)
@@ -436,7 +449,7 @@ def main():
 
     summaries = {}
     if "a" in args.tiers:
-        summaries["A"] = tier_a_quiet(model, out_dir, args.tier_a_episodes)
+        summaries["A"] = tier_a_quiet(model, out_dir, args.tier_a_episodes, history_stack_size=args.history_stack_size)
     if "b" in args.tiers:
         magnitudes = [float(x) for x in args.tier_b_magnitudes.split(",")]
         summaries["B"] = tier_b_push_grid(
@@ -449,9 +462,10 @@ def main():
             episodes_per_cell=args.tier_b_episodes,
             torque_z=args.tier_b_torque_z,
             randomize_torque_sign=args.tier_b_randomize_torque_sign,
+            history_stack_size=args.history_stack_size,
         )
     if "c" in args.tiers:
-        summaries["C"] = tier_c_random_push(model, out_dir, args.tier_c_episodes)
+        summaries["C"] = tier_c_random_push(model, out_dir, args.tier_c_episodes, history_stack_size=args.history_stack_size)
 
     summary_path = out_dir / "summary.json"
     with summary_path.open("w") as f:

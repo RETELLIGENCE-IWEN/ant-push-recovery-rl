@@ -20,6 +20,7 @@ from stable_directional_ant import (
     ControlledLocomotionAntWrapper,
     ControlledLocomotionRewardConfig,
     LateralErrorObservationWrapper,
+    ObservationHistoryStackWrapper,
     WellTrainedLocomotionAntWrapper,
     WellTrainedLocomotionRewardConfig,
 )
@@ -55,6 +56,7 @@ def main() -> None:
     parser.add_argument("--well-trained-target-height", type=float, default=0.53)
     parser.add_argument("--well-trained-velocity-obs-scale", type=float, default=3.0)
     parser.add_argument("--well-trained-include-command-observation", action="store_true")
+    parser.add_argument("--history-stack-size", type=int, default=1)
     args = parser.parse_args()
 
     torch.set_num_threads(1)
@@ -95,6 +97,8 @@ def main() -> None:
             env,
             clip=args.lateral_error_observation_clip,
         )
+    if args.history_stack_size > 1:
+        env = ObservationHistoryStackWrapper(env, stack_size=args.history_stack_size)
     obs, info = env.reset(seed=args.seed)
 
     model = PPO.load(args.model, device="cpu")

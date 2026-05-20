@@ -26,6 +26,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMoni
 from stable_directional_ant import (
     DomainRandomizationConfig,
     DomainRandomizationWrapper,
+    ObservationHistoryStackWrapper,
     PushDisturbanceConfig,
     PushDisturbanceWrapper,
     WellTrainedLocomotionAntWrapper,
@@ -39,12 +40,15 @@ def make_env(
     reward_config: WellTrainedLocomotionRewardConfig,
     push_config: PushDisturbanceConfig,
     dr_config: DomainRandomizationConfig,
+    history_stack_size: int,
 ):
     def _init():
         env = gym.make("Ant-v5")
         env = DomainRandomizationWrapper(env, config=dr_config)
         env = PushDisturbanceWrapper(env, config=push_config)
         env = WellTrainedLocomotionAntWrapper(env, reward_config=reward_config)
+        if history_stack_size > 1:
+            env = ObservationHistoryStackWrapper(env, stack_size=history_stack_size)
         env.reset(seed=seed + rank)
         return env
 
@@ -59,6 +63,7 @@ def build_vec_env(args, reward_config, push_config, dr_config):
             reward_config=reward_config,
             push_config=push_config,
             dr_config=dr_config,
+            history_stack_size=args.history_stack_size,
         )
         for i in range(args.n_envs)
     ]
@@ -69,12 +74,78 @@ def build_vec_env(args, reward_config, push_config, dr_config):
     return VecMonitor(env)
 
 
+def copy_policy_weights_with_expanded_input(source_model: PPO, target_model: PPO):
+    """Copy compatible tensors from source policy into target; for first-layer
+    weight matrices whose input dim is larger in target, copy source weights
+    into the leading columns and zero the rest (history-stack initialization)."""
+    source_state = source_model.policy.state_dict()
+    target_state = target_model.policy.state_dict()
+    copied = 0
+    skipped = []
+    for key, tgt in target_state.items():
+        src = source_state.get(key)
+        if src is None:
+            skipped.append(key)
+            continue
+        if src.shape == tgt.shape:
+            target_state[key] = src.detach().clone()
+            copied += 1
+            continue
+        can_expand = (
+            src.ndim == 2 and tgt.ndim == 2
+            and src.shape[0] == tgt.shape[0]
+            and src.shape[1] < tgt.shape[1]
+        )
+        if can_expand:
+            expanded = tgt.detach().clone()
+            expanded[:, : src.shape[1]] = src.detach()
+            expanded[:, src.shape[1]:] = 0.0
+            target_state[key] = expanded
+            copied += 1
+            continue
+        skipped.append(key)
+    target_model.policy.load_state_dict(target_state)
+    return copied, len(skipped), skipped
+
+
 def build_model(args: argparse.Namespace, env, log_dir: Path) -> PPO:
     if args.resume_from is None:
         raise ValueError(
             "train_robust_locomotion requires --resume-from a well-trained "
             "nominal policy (e.g. v3h_s2_seed42)."
         )
+
+    if args.warm_start_on_observation_mismatch:
+        print("[stage] warm-starting (input expansion) from:", args.resume_from)
+        source_model = PPO.load(args.resume_from, device="cpu")
+        policy_kwargs = dict(source_model.policy_kwargs)
+        model = PPO(
+            policy="MlpPolicy",
+            env=env,
+            device="cpu",
+            verbose=1,
+            seed=args.seed,
+            tensorboard_log=str(log_dir),
+            learning_rate=args.learning_rate,
+            n_steps=args.n_steps,
+            batch_size=args.batch_size,
+            n_epochs=args.n_epochs,
+            gamma=args.gamma,
+            gae_lambda=args.gae_lambda,
+            clip_range=args.clip_range,
+            ent_coef=args.ent_coef,
+            target_kl=args.target_kl,
+            max_grad_norm=args.max_grad_norm,
+            policy_kwargs=policy_kwargs,
+        )
+        copied, skipped_count, skipped = copy_policy_weights_with_expanded_input(
+            source_model=source_model,
+            target_model=model,
+        )
+        print(f"[warm-start] copied={copied} skipped={skipped_count}")
+        if skipped:
+            print("[warm-start] skipped names:", skipped[:10])
+        return model
 
     print("[stage] warm-starting from:", args.resume_from)
     return PPO.load(
@@ -98,6 +169,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-name", type=str, default="robust_locomotion_v4a")
     parser.add_argument("--resume-from", type=str, required=True)
+    parser.add_argument(
+        "--warm-start-on-observation-mismatch",
+        action="store_true",
+        help="Copy compatible weights and zero-init new input columns "
+        "(use when warm-starting into a larger observation, e.g. history stack).",
+    )
+    parser.add_argument(
+        "--history-stack-size", type=int, default=1,
+        help="Stack last N observations as policy input (1 = no stacking).",
+    )
     parser.add_argument("--total-steps", type=int, default=1_500_000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-envs", type=int, default=4)
@@ -115,6 +196,7 @@ def main() -> None:
     parser.add_argument("--clip-range", type=float, default=0.2)
     parser.add_argument("--ent-coef", type=float, default=0.0)
     parser.add_argument("--target-kl", type=float, default=None)
+    parser.add_argument("--max-grad-norm", type=float, default=0.5)
 
     # Reward config (matches v3h Stage 2 final settings by default)
     parser.add_argument("--target-forward-velocity", type=float, default=2.0)

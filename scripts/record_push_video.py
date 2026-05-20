@@ -17,6 +17,7 @@ import torch
 from stable_baselines3 import PPO
 
 from stable_directional_ant import (
+    ObservationHistoryStackWrapper,
     WellTrainedLocomotionAntWrapper,
     WellTrainedLocomotionRewardConfig,
 )
@@ -33,6 +34,7 @@ def main():
     parser.add_argument("--push-force", type=float, default=10.0)
     parser.add_argument("--push-direction-deg", type=float, default=90.0)
     parser.add_argument("--push-torque-z", type=float, default=0.0)
+    parser.add_argument("--history-stack-size", type=int, default=1)
     parser.add_argument("--fps", type=int, default=30)
     args = parser.parse_args()
 
@@ -44,6 +46,8 @@ def main():
     env = WellTrainedLocomotionAntWrapper(
         env, reward_config=WellTrainedLocomotionRewardConfig()
     )
+    if args.history_stack_size > 1:
+        env = ObservationHistoryStackWrapper(env, stack_size=args.history_stack_size)
 
     model = env.unwrapped.model
     torso_id = None
