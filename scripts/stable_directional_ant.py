@@ -1,0 +1,666 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import gymnasium as gym
+import numpy as np
+from gymnasium import spaces
+
+
+@dataclass(frozen=True)
+class StableDirectionalRewardConfig:
+    # Direction control
+    target_yaw: float = 0.0
+    w_heading: float = 0.35
+    w_lateral_velocity: float = 0.08
+    w_lateral_position: float = 0.0
+    lateral_position_clip: float = 5.0
+    w_yaw_rate: float = 0.03
+    target_forward_velocity: float | None = None
+    w_forward_velocity: float = 0.0
+
+    # Body stability
+    target_height: float | None = None
+    w_roll_pitch: float = 0.12
+    w_height: float = 0.40
+    w_vertical_velocity: float = 0.03
+
+    # Smooth control
+    w_action_smooth: float = 0.015
+
+
+def wrap_angle_rad(x: float) -> float:
+    return float((x + np.pi) % (2.0 * np.pi) - np.pi)
+
+
+def quat_wxyz_to_rpy(q: np.ndarray) -> tuple[float, float, float]:
+    """
+    Convert MuJoCo free-joint quaternion [w, x, y, z] to roll, pitch, yaw.
+    """
+    w, x, y, z = [float(v) for v in q]
+
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2.0 * (w * y - z * x)
+    sinp = max(-1.0, min(1.0, sinp))
+    pitch = math.asin(sinp)
+
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+
+    return float(roll), float(pitch), float(yaw)
+
+
+class StableDirectionalAntWrapper(gym.Wrapper):
+    """
+    Reward-shaping wrapper for heading-constrained and body-stable Ant locomotion.
+
+    It keeps the original Ant-v5 reward and adds mild shaping terms:
+
+        r_total = r_ant_base
+                - heading error penalty
+                - lateral velocity penalty
+                - weak lateral position penalty
+                - yaw rate penalty
+                - optional forward velocity target penalty
+                - roll/pitch penalty
+                - height tracking penalty
+                - vertical velocity penalty
+                - action delta penalty
+
+    The goal is not to over-constrain gait, but to reduce side-walking,
+    heading drift, body oscillation, and high-frequency action jitter.
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        reward_config: StableDirectionalRewardConfig | None = None,
+    ):
+        super().__init__(env)
+        self.cfg = reward_config or StableDirectionalRewardConfig()
+        self.prev_action: np.ndarray | None = None
+        self.episode_target_height: float | None = None
+        self.episode_initial_y: float | None = None
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self.prev_action = None
+
+        z = self._root_z()
+        self.episode_target_height = (
+            float(z) if self.cfg.target_height is None else float(self.cfg.target_height)
+        )
+        self.episode_initial_y = self._root_y()
+
+        return obs, info
+
+    def step(self, action):
+        obs, base_reward, terminated, truncated, info = self.env.step(action)
+
+        action_np = np.asarray(action, dtype=np.float64)
+        terms = self._compute_reward_terms(action_np)
+
+        shaped_reward = float(base_reward) + float(sum(terms.values()))
+
+        info = dict(info)
+        info["base_reward"] = float(base_reward)
+        info["stable_shaping_reward"] = float(sum(terms.values()))
+        for key, value in terms.items():
+            info[f"stable_{key}"] = float(value)
+
+        metrics = self.compute_metrics()
+        for key, value in metrics.items():
+            info[f"metric_{key}"] = float(value)
+
+        self.prev_action = action_np.copy()
+
+        return obs, shaped_reward, terminated, truncated, info
+
+    def _compute_reward_terms(self, action: np.ndarray) -> dict[str, float]:
+        cfg = self.cfg
+        metrics = self.compute_metrics()
+
+        yaw_error = wrap_angle_rad(metrics["yaw"] - cfg.target_yaw)
+
+        # Direction stability
+        heading_penalty = -cfg.w_heading * (1.0 - math.cos(yaw_error))
+        lateral_velocity_penalty = -cfg.w_lateral_velocity * metrics["vy"] ** 2
+        initial_y = (
+            self.episode_initial_y
+            if self.episode_initial_y is not None
+            else metrics["y"]
+        )
+        lateral_position_error = metrics["y"] - initial_y
+        lateral_position_error = float(
+            np.clip(
+                lateral_position_error,
+                -cfg.lateral_position_clip,
+                cfg.lateral_position_clip,
+            )
+        )
+        lateral_position_penalty = (
+            -cfg.w_lateral_position * lateral_position_error**2
+        )
+        yaw_rate_penalty = -cfg.w_yaw_rate * metrics["yaw_rate"] ** 2
+        if cfg.target_forward_velocity is None:
+            forward_velocity_penalty = 0.0
+        else:
+            forward_velocity_error = metrics["vx"] - cfg.target_forward_velocity
+            forward_velocity_penalty = -cfg.w_forward_velocity * forward_velocity_error**2
+
+        # Body stability
+        roll_pitch_penalty = -cfg.w_roll_pitch * (
+            metrics["roll"] ** 2 + metrics["pitch"] ** 2
+        )
+
+        target_height = (
+            self.episode_target_height
+            if self.episode_target_height is not None
+            else metrics["z"]
+        )
+        height_error = metrics["z"] - target_height
+        height_penalty = -cfg.w_height * height_error**2
+
+        vertical_velocity_penalty = -cfg.w_vertical_velocity * metrics["vz"] ** 2
+
+        # Smoothness
+        if self.prev_action is None:
+            action_smooth_penalty = 0.0
+        else:
+            da = action - self.prev_action
+            action_smooth_penalty = -cfg.w_action_smooth * float(np.sum(da * da))
+
+        return {
+            "heading": heading_penalty,
+            "lateral_velocity": lateral_velocity_penalty,
+            "lateral_position": lateral_position_penalty,
+            "yaw_rate": yaw_rate_penalty,
+            "forward_velocity": forward_velocity_penalty,
+            "roll_pitch": roll_pitch_penalty,
+            "height": height_penalty,
+            "vertical_velocity": vertical_velocity_penalty,
+            "action_smooth": action_smooth_penalty,
+        }
+
+    def compute_metrics(self) -> dict[str, float]:
+        qpos = np.asarray(self.unwrapped.data.qpos, dtype=np.float64)
+        qvel = np.asarray(self.unwrapped.data.qvel, dtype=np.float64)
+
+        x = float(qpos[0])
+        y = float(qpos[1])
+        z = float(qpos[2])
+        quat_wxyz = qpos[3:7]
+        roll, pitch, yaw = quat_wxyz_to_rpy(quat_wxyz)
+
+        vx = float(qvel[0])
+        vy = float(qvel[1])
+        vz = float(qvel[2])
+
+        # For MuJoCo free joints, qvel[3:6] are root angular velocity components.
+        wx = float(qvel[3])
+        wy = float(qvel[4])
+        wz = float(qvel[5])
+
+        return {
+            "x": x,
+            "y": y,
+            "z": z,
+            "roll": roll,
+            "pitch": pitch,
+            "yaw": yaw,
+            "vx": vx,
+            "vy": vy,
+            "vz": vz,
+            "roll_rate": wx,
+            "pitch_rate": wy,
+            "yaw_rate": wz,
+            "heading_alignment": math.cos(wrap_angle_rad(yaw - self.cfg.target_yaw)),
+        }
+
+    def _root_z(self) -> float:
+        return float(self.unwrapped.data.qpos[2])
+
+    def _root_y(self) -> float:
+        return float(self.unwrapped.data.qpos[1])
+
+
+class LateralErrorObservationWrapper(gym.ObservationWrapper):
+    """
+    Append normalized lateral displacement to the Ant observation.
+
+    Gymnasium Ant-v5 excludes global x/y position from the default observation, so a
+    reward term based on y displacement is only partially observable to the policy.
+    This wrapper adds clip(y - y_initial) / clip as a compact correction signal.
+    """
+
+    def __init__(self, env: gym.Env, clip: float = 5.0):
+        super().__init__(env)
+        if not isinstance(env.observation_space, spaces.Box):
+            raise TypeError("LateralErrorObservationWrapper requires a Box observation.")
+        if clip <= 0.0:
+            raise ValueError("clip must be positive.")
+
+        self.clip = float(clip)
+        self.episode_initial_y: float | None = None
+
+        low = np.concatenate(
+            [
+                np.asarray(env.observation_space.low, dtype=np.float32),
+                np.array([-1.0], dtype=np.float32),
+            ]
+        )
+        high = np.concatenate(
+            [
+                np.asarray(env.observation_space.high, dtype=np.float32),
+                np.array([1.0], dtype=np.float32),
+            ]
+        )
+        self.observation_space = spaces.Box(
+            low=low,
+            high=high,
+            dtype=env.observation_space.dtype,
+        )
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self.episode_initial_y = self._root_y()
+        return self.observation(obs), info
+
+    def observation(self, observation):
+        y_error = self._root_y() - (
+            self.episode_initial_y
+            if self.episode_initial_y is not None
+            else self._root_y()
+        )
+        normalized_y_error = float(np.clip(y_error, -self.clip, self.clip) / self.clip)
+        return np.concatenate(
+            [
+                np.asarray(observation, dtype=self.observation_space.dtype),
+                np.array([normalized_y_error], dtype=self.observation_space.dtype),
+            ]
+        )
+
+    def _root_y(self) -> float:
+        return float(self.unwrapped.data.qpos[1])
+
+
+@dataclass(frozen=True)
+class ControlledLocomotionRewardConfig:
+    # Command tracking
+    target_forward_velocity: float = 2.0
+    target_lateral_velocity: float = 0.0
+    target_yaw_rate: float = 0.0
+    target_yaw: float = 0.0
+    target_height: float = 0.53
+    target_velocity_obs_scale: float = 3.0
+    target_yaw_rate_obs_scale: float = 2.0
+    randomize_commands: bool = False
+    command_forward_velocity_min: float = 1.6
+    command_forward_velocity_max: float = 2.2
+    command_lateral_velocity_min: float = 0.0
+    command_lateral_velocity_max: float = 0.0
+    command_yaw_rate_min: float = 0.0
+    command_yaw_rate_max: float = 0.0
+
+    # Observation normalization
+    lateral_position_clip: float = 5.0
+    lateral_position_reward_clip: float = 5.0
+    lateral_position_soft_limit: float = 0.0
+    include_command_observation: bool = False
+
+    # Positive tracking rewards
+    w_alive: float = 0.8
+    w_velocity_tracking: float = 1.6
+    velocity_tracking_sigma: float = 0.25
+    w_lateral_velocity_tracking: float = 0.0
+    lateral_velocity_tracking_sigma: float = 0.25
+    w_yaw_rate_tracking: float = 0.0
+    yaw_rate_tracking_sigma: float = 0.25
+    w_heading_tracking: float = 1.2
+    heading_tracking_sigma: float = 0.50
+    w_course_tracking: float = 0.0
+    course_tracking_sigma: float = 0.25
+    course_tracking_min_speed: float = 0.25
+
+    # Stability and path penalties
+    w_lateral_position: float = 0.035
+    w_lateral_velocity: float = 0.10
+    w_lateral_away_velocity: float = 0.0
+    w_yaw_rate: float = 0.03
+    w_roll_pitch: float = 0.12
+    w_roll_pitch_rate: float = 0.03
+    w_height: float = 0.60
+    w_vertical_velocity: float = 0.04
+
+    # Control quality penalties
+    w_action_energy: float = 0.02
+    w_action_rate: float = 0.05
+    w_action_accel: float = 0.015
+
+
+class ControlledLocomotionAntWrapper(gym.Wrapper):
+    """
+    Command-tracking locomotion objective for v3.
+
+    Unlike StableDirectionalAntWrapper, this wrapper does not add penalties to
+    the original Ant forward reward. It replaces the reward with a robotics-style
+    command tracking objective: target forward/lateral velocity, heading/yaw-rate
+    alignment, velocity-vector alignment, lateral centering, body stability, and
+    smooth control.
+
+    The observation is also augmented with compact command/error signals:
+    normalized lateral displacement, sin/cos heading error, normalized target
+    forward velocity, and the previous action.
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        reward_config: ControlledLocomotionRewardConfig | None = None,
+    ):
+        super().__init__(env)
+        if not isinstance(env.observation_space, spaces.Box):
+            raise TypeError("ControlledLocomotionAntWrapper requires a Box observation.")
+
+        self.cfg = reward_config or ControlledLocomotionRewardConfig()
+        self.episode_initial_y: float | None = None
+        self.current_target_forward_velocity = self.cfg.target_forward_velocity
+        self.current_target_lateral_velocity = self.cfg.target_lateral_velocity
+        self.current_target_yaw_rate = self.cfg.target_yaw_rate
+        self.prev_action = np.zeros(self.action_space.shape, dtype=np.float64)
+        self.prev_prev_action = np.zeros(self.action_space.shape, dtype=np.float64)
+
+        compact_signal_dim = 4
+        if self.cfg.include_command_observation:
+            compact_signal_dim += 2
+
+        extra_low = np.concatenate(
+            [
+                -np.ones(compact_signal_dim, dtype=np.float32),
+                np.asarray(self.action_space.low, dtype=np.float32),
+            ]
+        )
+        extra_high = np.concatenate(
+            [
+                np.ones(compact_signal_dim, dtype=np.float32),
+                np.asarray(self.action_space.high, dtype=np.float32),
+            ]
+        )
+        low = np.concatenate(
+            [
+                np.asarray(env.observation_space.low, dtype=np.float32),
+                extra_low,
+            ]
+        )
+        high = np.concatenate(
+            [
+                np.asarray(env.observation_space.high, dtype=np.float32),
+                extra_high,
+            ]
+        )
+        self.observation_space = spaces.Box(
+            low=low,
+            high=high,
+            dtype=env.observation_space.dtype,
+        )
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self.episode_initial_y = self._root_y()
+        self._sample_command()
+        self.prev_action = np.zeros(self.action_space.shape, dtype=np.float64)
+        self.prev_prev_action = np.zeros(self.action_space.shape, dtype=np.float64)
+        return self._augment_observation(obs), info
+
+    def step(self, action):
+        obs, base_reward, terminated, truncated, info = self.env.step(action)
+
+        action_np = np.asarray(action, dtype=np.float64)
+        metrics = self.compute_metrics()
+        terms = self._compute_reward_terms(
+            action=action_np,
+            metrics=metrics,
+            terminated=terminated,
+        )
+        controlled_reward = float(sum(terms.values()))
+
+        info = dict(info)
+        info["base_reward"] = float(base_reward)
+        info["controlled_reward"] = controlled_reward
+        for key, value in terms.items():
+            info[f"controlled_{key}"] = float(value)
+        for key, value in metrics.items():
+            info[f"metric_{key}"] = float(value)
+
+        self.prev_prev_action = self.prev_action.copy()
+        self.prev_action = action_np.copy()
+
+        return self._augment_observation(obs), controlled_reward, terminated, truncated, info
+
+    def _augment_observation(self, observation):
+        metrics = self.compute_metrics()
+        normalized_y_error = self._normalized_lateral_position_error(metrics["y"])
+        yaw_error = wrap_angle_rad(metrics["yaw"] - self.cfg.target_yaw)
+        target_vx = self._normalized_target_velocity(
+            self.current_target_forward_velocity
+        )
+        compact_signals = [
+            normalized_y_error,
+            math.sin(yaw_error),
+            math.cos(yaw_error),
+            target_vx,
+        ]
+        if self.cfg.include_command_observation:
+            compact_signals.extend(
+                [
+                    self._normalized_target_velocity(
+                        self.current_target_lateral_velocity
+                    ),
+                    self._normalized_target_yaw_rate(),
+                ]
+            )
+        extra = np.concatenate(
+            [
+                np.array(compact_signals, dtype=self.observation_space.dtype),
+                self.prev_action.astype(self.observation_space.dtype),
+            ]
+        )
+        return np.concatenate(
+            [
+                np.asarray(observation, dtype=self.observation_space.dtype),
+                extra,
+            ]
+        )
+
+    def _compute_reward_terms(
+        self,
+        action: np.ndarray,
+        metrics: dict[str, float],
+        terminated: bool,
+    ) -> dict[str, float]:
+        cfg = self.cfg
+
+        vx_error = metrics["vx"] - self.current_target_forward_velocity
+        velocity_tracking = cfg.w_velocity_tracking * math.exp(
+            -(vx_error**2) / max(cfg.velocity_tracking_sigma, 1e-9)
+        )
+        vy_error = metrics["vy"] - self.current_target_lateral_velocity
+        lateral_velocity_tracking = cfg.w_lateral_velocity_tracking * math.exp(
+            -(vy_error**2) / max(cfg.lateral_velocity_tracking_sigma, 1e-9)
+        )
+        yaw_rate_error = metrics["yaw_rate"] - self.current_target_yaw_rate
+        yaw_rate_tracking = cfg.w_yaw_rate_tracking * math.exp(
+            -(yaw_rate_error**2) / max(cfg.yaw_rate_tracking_sigma, 1e-9)
+        )
+
+        yaw_error = wrap_angle_rad(metrics["yaw"] - cfg.target_yaw)
+        heading_tracking = cfg.w_heading_tracking * math.exp(
+            -(yaw_error**2) / max(cfg.heading_tracking_sigma, 1e-9)
+        )
+
+        course_tracking = 0.0
+        if metrics["speed_xy"] >= cfg.course_tracking_min_speed:
+            course_tracking = cfg.w_course_tracking * math.exp(
+                -(metrics["course_error"] ** 2) / max(cfg.course_tracking_sigma, 1e-9)
+            )
+
+        y_error = self._raw_lateral_position_error(metrics["y"])
+        lateral_position_penalty = -cfg.w_lateral_position * (
+            self._lateral_position_loss(y_error)
+        )
+        lateral_away_velocity_penalty = -cfg.w_lateral_away_velocity * max(
+            0.0,
+            y_error * metrics["vy"],
+        )
+
+        roll_pitch_penalty = -cfg.w_roll_pitch * (
+            metrics["roll"] ** 2 + metrics["pitch"] ** 2
+        )
+        roll_pitch_rate_penalty = -cfg.w_roll_pitch_rate * (
+            metrics["roll_rate"] ** 2 + metrics["pitch_rate"] ** 2
+        )
+        height_error = metrics["z"] - cfg.target_height
+        height_penalty = -cfg.w_height * height_error**2
+
+        action_rate = action - self.prev_action
+        action_accel = action - 2.0 * self.prev_action + self.prev_prev_action
+
+        return {
+            "alive": cfg.w_alive if not terminated else 0.0,
+            "velocity_tracking": velocity_tracking,
+            "lateral_velocity_tracking": lateral_velocity_tracking,
+            "yaw_rate_tracking": yaw_rate_tracking,
+            "heading_tracking": heading_tracking,
+            "course_tracking": course_tracking,
+            "lateral_position": lateral_position_penalty,
+            "lateral_velocity": -cfg.w_lateral_velocity * vy_error**2,
+            "lateral_away_velocity": lateral_away_velocity_penalty,
+            "yaw_rate": -cfg.w_yaw_rate * yaw_rate_error**2,
+            "roll_pitch": roll_pitch_penalty,
+            "roll_pitch_rate": roll_pitch_rate_penalty,
+            "height": height_penalty,
+            "vertical_velocity": -cfg.w_vertical_velocity * metrics["vz"] ** 2,
+            "action_energy": -cfg.w_action_energy * float(np.sum(action * action)),
+            "action_rate": -cfg.w_action_rate * float(np.sum(action_rate * action_rate)),
+            "action_accel": -cfg.w_action_accel * float(np.sum(action_accel * action_accel)),
+        }
+
+    def compute_metrics(self) -> dict[str, float]:
+        qpos = np.asarray(self.unwrapped.data.qpos, dtype=np.float64)
+        qvel = np.asarray(self.unwrapped.data.qvel, dtype=np.float64)
+
+        roll, pitch, yaw = quat_wxyz_to_rpy(qpos[3:7])
+        vx = float(qvel[0])
+        vy = float(qvel[1])
+        speed_xy = float(math.hypot(vx, vy))
+        target_course_yaw = self._target_course_yaw()
+        course_yaw = target_course_yaw
+        if speed_xy > 1e-9:
+            course_yaw = math.atan2(vy, vx)
+        course_error = wrap_angle_rad(course_yaw - target_course_yaw)
+
+        return {
+            "x": float(qpos[0]),
+            "y": float(qpos[1]),
+            "z": float(qpos[2]),
+            "roll": roll,
+            "pitch": pitch,
+            "yaw": yaw,
+            "vx": vx,
+            "vy": vy,
+            "vz": float(qvel[2]),
+            "roll_rate": float(qvel[3]),
+            "pitch_rate": float(qvel[4]),
+            "yaw_rate": float(qvel[5]),
+            "heading_alignment": math.cos(wrap_angle_rad(yaw - self.cfg.target_yaw)),
+            "speed_xy": speed_xy,
+            "course_yaw": float(course_yaw),
+            "course_error": float(course_error),
+            "course_alignment": math.cos(course_error),
+            "target_course_yaw": float(target_course_yaw),
+            "target_vx": float(self.current_target_forward_velocity),
+            "target_vy": float(self.current_target_lateral_velocity),
+            "target_yaw_rate": float(self.current_target_yaw_rate),
+        }
+
+    def _raw_lateral_position_error(self, y: float) -> float:
+        initial_y = self.episode_initial_y if self.episode_initial_y is not None else y
+        return float(y - initial_y)
+
+    def _normalized_lateral_position_error(self, y: float) -> float:
+        clip = max(self.cfg.lateral_position_clip, 1e-9)
+        return float(np.clip(self._raw_lateral_position_error(y), -clip, clip) / clip)
+
+    def _lateral_position_loss(self, y_error: float) -> float:
+        reward_clip = self.cfg.lateral_position_reward_clip
+        if reward_clip > 0.0:
+            clipped_y_error = float(np.clip(y_error, -reward_clip, reward_clip))
+            return clipped_y_error**2
+
+        soft_limit = self.cfg.lateral_position_soft_limit
+        if soft_limit <= 0.0:
+            return y_error**2
+
+        abs_y_error = abs(y_error)
+        if abs_y_error <= soft_limit:
+            return y_error**2
+        return float(
+            soft_limit * (2.0 * abs_y_error - soft_limit)
+        )
+
+    def _normalized_target_velocity(self, velocity: float) -> float:
+        scale = max(self.cfg.target_velocity_obs_scale, 1e-9)
+        return float(np.clip(velocity / scale, -1.0, 1.0))
+
+    def _normalized_target_yaw_rate(self) -> float:
+        scale = max(self.cfg.target_yaw_rate_obs_scale, 1e-9)
+        return float(np.clip(self.current_target_yaw_rate / scale, -1.0, 1.0))
+
+    def _target_course_yaw(self) -> float:
+        command_speed = math.hypot(
+            self.current_target_forward_velocity,
+            self.current_target_lateral_velocity,
+        )
+        if command_speed <= 1e-9:
+            return self.cfg.target_yaw
+        return float(
+            math.atan2(
+                self.current_target_lateral_velocity,
+                self.current_target_forward_velocity,
+            )
+        )
+
+    def _sample_command(self) -> None:
+        if not self.cfg.randomize_commands:
+            self.current_target_forward_velocity = self.cfg.target_forward_velocity
+            self.current_target_lateral_velocity = self.cfg.target_lateral_velocity
+            self.current_target_yaw_rate = self.cfg.target_yaw_rate
+            return
+
+        rng = self.unwrapped.np_random
+        self.current_target_forward_velocity = float(
+            rng.uniform(
+                self.cfg.command_forward_velocity_min,
+                self.cfg.command_forward_velocity_max,
+            )
+        )
+        self.current_target_lateral_velocity = float(
+            rng.uniform(
+                self.cfg.command_lateral_velocity_min,
+                self.cfg.command_lateral_velocity_max,
+            )
+        )
+        self.current_target_yaw_rate = float(
+            rng.uniform(
+                self.cfg.command_yaw_rate_min,
+                self.cfg.command_yaw_rate_max,
+            )
+        )
+
+    def _root_y(self) -> float:
+        return float(self.unwrapped.data.qpos[1])

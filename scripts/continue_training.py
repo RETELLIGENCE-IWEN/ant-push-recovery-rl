@@ -4,7 +4,6 @@ import argparse
 import os
 from pathlib import Path
 
-# Must be set before heavy native libs are used.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -15,6 +14,7 @@ os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
 import gymnasium as gym
 import torch
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 
 
@@ -29,66 +29,67 @@ def make_env(seed: int):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run-name", type=str, default="baseline_ppo_ant_50k")
-    parser.add_argument("--total-steps", type=int, default=50_000)
+    parser.add_argument("--resume-from", type=str, required=True)
+    parser.add_argument("--run-name", type=str, default="baseline_ppo_ant_continued")
+    parser.add_argument("--additional-steps", type=int, default=250_000)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--save-freq", type=int, default=50_000)
     args = parser.parse_args()
 
     torch.set_num_threads(1)
 
     run_dir = Path("runs") / args.run_name
     model_dir = run_dir / "models"
+    checkpoint_dir = run_dir / "checkpoints"
     log_dir = run_dir / "tb"
+
     model_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.smoke:
-        args.total_steps = 4_096
-
+    print("[config] resume_from:", args.resume_from)
     print("[config] run_name:", args.run_name)
-    print("[config] total_steps:", args.total_steps)
+    print("[config] additional_steps:", args.additional_steps)
     print("[config] seed:", args.seed)
-    print("[torch] version:", torch.__version__)
-    print("[torch] threads:", torch.get_num_threads())
 
     env = DummyVecEnv([make_env(args.seed)])
     env = VecMonitor(env)
 
-    print("[stage] creating PPO model")
+    print("[stage] loading model")
 
-    model = PPO(
-        policy="MlpPolicy",
+    model = PPO.load(
+        args.resume_from,
         env=env,
         device="cpu",
-        verbose=1,
-        seed=args.seed,
         tensorboard_log=str(log_dir),
-        n_steps=512,
-        batch_size=64,
-        n_epochs=5,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.0,
-        learning_rate=3e-4,
     )
 
-    print("[stage] starting learning")
+    print("[model] existing num_timesteps:", model.num_timesteps)
+
+    checkpoint_callback = CheckpointCallback(
+        save_freq=args.save_freq,
+        save_path=str(checkpoint_dir),
+        name_prefix="ppo_ant_checkpoint",
+        save_replay_buffer=False,
+        save_vecnormalize=False,
+    )
+
+    print("[stage] continuing learning")
 
     model.learn(
-        total_timesteps=args.total_steps,
+        total_timesteps=args.additional_steps,
+        reset_num_timesteps=False,
         tb_log_name=args.run_name,
+        callback=checkpoint_callback,
         progress_bar=False,
     )
-
-    print("[stage] saving model")
 
     save_path = model_dir / "final_model"
     model.save(str(save_path))
 
     env.close()
 
+    print("[done] final num_timesteps:", model.num_timesteps)
     print(f"[done] saved model to: {save_path}.zip")
 
 
