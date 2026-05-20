@@ -740,6 +740,19 @@ class WellTrainedLocomotionRewardConfig:
     w_action_energy: float = 0.005
     w_dof_vel: float = 0.001
 
+    # Windowed post-push recovery bonus. Activated by reading
+    # info["push_steps_since_end"] from the inner PushDisturbanceWrapper:
+    # within recovery_window_steps after a push ends, additional negative
+    # penalties on tracking errors push the policy to actively *recover*
+    # rather than passively survive. Outside the window these terms are zero
+    # so nominal gait is not affected. Defaults are off (all weights 0).
+    recovery_window_steps: int = 500           # 5s @ 100Hz
+    w_recovery_vx_err: float = 0.0             # |vx_body - target_vx|
+    w_recovery_vy_err: float = 0.0             # |vy_body|
+    w_recovery_yaw_err: float = 0.0            # |yaw - target_yaw|
+    w_recovery_roll_pitch: float = 0.0         # roll^2 + pitch^2
+    w_recovery_yaw_rate: float = 0.0           # |omega_z|
+
 
 class WellTrainedLocomotionAntWrapper(gym.Wrapper):
     """
@@ -834,6 +847,18 @@ class WellTrainedLocomotionAntWrapper(gym.Wrapper):
             metrics=metrics,
             terminated=terminated,
         )
+
+        # Windowed post-push recovery reward, read from inner PushDisturbanceWrapper.
+        steps_since_end = int(info.get("push_steps_since_end", -1))
+        push_active = bool(info.get("push_active", False))
+        recovery_terms = self._compute_recovery_reward_terms(
+            metrics=metrics,
+            push_active=push_active,
+            steps_since_end=steps_since_end,
+        )
+        for k, v in recovery_terms.items():
+            terms[k] = v
+
         reward = float(sum(terms.values()))
 
         info = dict(info)
@@ -848,6 +873,40 @@ class WellTrainedLocomotionAntWrapper(gym.Wrapper):
         self.prev_action = action_np.copy()
 
         return self._augment_observation(obs), reward, terminated, truncated, info
+
+    def _compute_recovery_reward_terms(
+        self,
+        metrics: dict[str, float],
+        push_active: bool,
+        steps_since_end: int,
+    ) -> dict[str, float]:
+        cfg = self.cfg
+        # Gate: active during push and for `recovery_window_steps` after push end.
+        in_window = push_active or (
+            0 <= steps_since_end < cfg.recovery_window_steps
+        )
+        if not in_window:
+            return {
+                "recovery_vx_err": 0.0,
+                "recovery_vy_err": 0.0,
+                "recovery_yaw_err": 0.0,
+                "recovery_roll_pitch": 0.0,
+                "recovery_yaw_rate": 0.0,
+            }
+
+        vx_err = abs(metrics["vx_body"] - self.current_target_vx)
+        vy_err = abs(metrics["vy_body"] - self.current_target_vy)
+        yaw_err = abs(wrap_angle_rad(metrics["yaw"] - cfg.target_yaw))
+        roll_pitch_sq = metrics["roll"] ** 2 + metrics["pitch"] ** 2
+        yaw_rate_abs = abs(metrics["yaw_rate"] - self.current_target_omega_z)
+
+        return {
+            "recovery_vx_err": -cfg.w_recovery_vx_err * vx_err,
+            "recovery_vy_err": -cfg.w_recovery_vy_err * vy_err,
+            "recovery_yaw_err": -cfg.w_recovery_yaw_err * yaw_err,
+            "recovery_roll_pitch": -cfg.w_recovery_roll_pitch * roll_pitch_sq,
+            "recovery_yaw_rate": -cfg.w_recovery_yaw_rate * yaw_rate_abs,
+        }
 
     def _augment_observation(self, observation):
         metrics = self.compute_metrics()
@@ -1062,6 +1121,21 @@ class PushDisturbanceConfig:
     push_torque_z_max: float = 0.0     # N·m, yaw twist around torso z-axis
     push_duration_max_steps: int = 0   # if > 0, duration is ramped from push_duration_steps to this value
 
+    # Phase 2c boundary sampling: instead of uniform [0, max], sample from a
+    # three-mode mixture concentrated at the failure boundary. Activated by
+    # use_boundary_sampling=True. Mode weights must sum to ~1.0.
+    use_boundary_sampling: bool = False
+    boundary_mode_weights: tuple = (0.2, 0.6, 0.2)  # easy / boundary / hard
+    boundary_easy_force_range: tuple = (5.0, 8.0)
+    boundary_easy_duration_range: tuple = (15, 20)
+    boundary_easy_torque_range: tuple = (0.05, 0.10)
+    boundary_mid_force_range: tuple = (8.0, 12.0)
+    boundary_mid_duration_range: tuple = (20, 30)
+    boundary_mid_torque_range: tuple = (0.10, 0.18)
+    boundary_hard_force_range: tuple = (12.0, 15.0)
+    boundary_hard_duration_range: tuple = (25, 30)
+    boundary_hard_torque_range: tuple = (0.15, 0.20)
+
 
 class PushDisturbanceWrapper(gym.Wrapper):
     """
@@ -1112,6 +1186,9 @@ class PushDisturbanceWrapper(gym.Wrapper):
         self._current_force_xy = np.zeros(2, dtype=np.float64)
         self._current_force_magnitude = 0.0
         self._current_torque_z = 0.0
+        # For recovery-window reward computation in outer wrappers:
+        # 0 while push is active, then counts up after push end (-1 if never pushed).
+        self._steps_since_push_end = -1
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
@@ -1123,6 +1200,7 @@ class PushDisturbanceWrapper(gym.Wrapper):
         self._current_force_xy[:] = 0.0
         self._current_force_magnitude = 0.0
         self._current_torque_z = 0.0
+        self._steps_since_push_end = -1
         return obs, info
 
     def step(self, action):
@@ -1139,6 +1217,8 @@ class PushDisturbanceWrapper(gym.Wrapper):
         info["push_force_dir_x"] = float(self._current_force_xy[0] / max(self._current_force_magnitude, 1e-9))
         info["push_force_dir_y"] = float(self._current_force_xy[1] / max(self._current_force_magnitude, 1e-9))
         info["push_torque_z"] = float(self._current_torque_z)
+        info["push_active"] = bool(self._push_remaining_steps > 0)
+        info["push_steps_since_end"] = int(self._steps_since_push_end)
         info["push_curriculum_force_max"] = float(self._current_max_force())
 
         self._env_step_count += 1
@@ -1150,6 +1230,9 @@ class PushDisturbanceWrapper(gym.Wrapper):
                 self._current_force_xy[:] = 0.0
                 self._current_torque_z = 0.0
                 self._next_push_step = self._env_step_count + self._sample_interval()
+                self._steps_since_push_end = 0
+        elif self._steps_since_push_end >= 0:
+            self._steps_since_push_end += 1
 
         return obs, reward, terminated, truncated, info
 
@@ -1193,13 +1276,53 @@ class PushDisturbanceWrapper(gym.Wrapper):
         if self._env_step_count < self._next_push_step:
             return
 
+        rng = self.unwrapped.np_random
+        cfg = self.cfg
+
+        if cfg.use_boundary_sampling:
+            # Sample mode by mixture weights, then sample within mode ranges.
+            weights = list(cfg.boundary_mode_weights)
+            r = float(rng.uniform(0.0, sum(weights)))
+            cum = 0.0
+            mode = 0
+            for i, w in enumerate(weights):
+                cum += w
+                if r <= cum:
+                    mode = i
+                    break
+            if mode == 0:
+                f_range = cfg.boundary_easy_force_range
+                d_range = cfg.boundary_easy_duration_range
+                t_range = cfg.boundary_easy_torque_range
+            elif mode == 1:
+                f_range = cfg.boundary_mid_force_range
+                d_range = cfg.boundary_mid_duration_range
+                t_range = cfg.boundary_mid_torque_range
+            else:
+                f_range = cfg.boundary_hard_force_range
+                d_range = cfg.boundary_hard_duration_range
+                t_range = cfg.boundary_hard_torque_range
+
+            magnitude = float(rng.uniform(f_range[0], f_range[1]))
+            duration = int(round(float(rng.uniform(d_range[0], d_range[1]))))
+            torque_mag = float(rng.uniform(t_range[0], t_range[1]))
+            torque_sign = 1.0 if rng.uniform(0.0, 1.0) > 0.5 else -1.0
+            theta = float(rng.uniform(0.0, 2.0 * math.pi))
+
+            self._current_force_xy[0] = magnitude * math.cos(theta)
+            self._current_force_xy[1] = magnitude * math.sin(theta)
+            self._current_force_magnitude = magnitude
+            self._current_torque_z = torque_sign * torque_mag
+            self._push_remaining_steps = duration
+            return
+
+        # Default uniform curriculum sampling
         max_f = self._current_max_force()
         max_tau = self._current_max_torque_z()
         if max_f <= 0.0 and max_tau <= 0.0:
             self._next_push_step = self._env_step_count + self._sample_interval()
             return
 
-        rng = self.unwrapped.np_random
         theta = float(rng.uniform(0.0, 2.0 * math.pi))
         magnitude = float(rng.uniform(0.0, max_f)) if max_f > 0.0 else 0.0
         self._current_force_xy[0] = magnitude * math.cos(theta)

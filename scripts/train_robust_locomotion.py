@@ -140,6 +140,14 @@ def main() -> None:
     parser.add_argument("--push-initial-quiet-steps", type=int, default=10_000)
     parser.add_argument("--push-torque-z-max", type=float, default=0.0)
     parser.add_argument("--push-duration-max-steps", type=int, default=0)
+    parser.add_argument("--push-use-boundary-sampling", action="store_true")
+
+    parser.add_argument("--recovery-window-steps", type=int, default=500)
+    parser.add_argument("--w-recovery-vx-err", type=float, default=0.0)
+    parser.add_argument("--w-recovery-vy-err", type=float, default=0.0)
+    parser.add_argument("--w-recovery-yaw-err", type=float, default=0.0)
+    parser.add_argument("--w-recovery-roll-pitch", type=float, default=0.0)
+    parser.add_argument("--w-recovery-yaw-rate", type=float, default=0.0)
 
     # Domain randomization
     parser.add_argument("--dr-enabled", type=int, default=1)
@@ -173,6 +181,12 @@ def main() -> None:
         w_lateral_position=args.w_lateral_position,
         w_action_rate=args.w_action_rate,
         w_action_accel=args.w_action_accel,
+        recovery_window_steps=args.recovery_window_steps,
+        w_recovery_vx_err=args.w_recovery_vx_err,
+        w_recovery_vy_err=args.w_recovery_vy_err,
+        w_recovery_yaw_err=args.w_recovery_yaw_err,
+        w_recovery_roll_pitch=args.w_recovery_roll_pitch,
+        w_recovery_yaw_rate=args.w_recovery_yaw_rate,
     )
     push_config = PushDisturbanceConfig(
         enabled=bool(args.push_enabled),
@@ -184,6 +198,7 @@ def main() -> None:
         initial_quiet_steps=args.push_initial_quiet_steps,
         push_torque_z_max=args.push_torque_z_max,
         push_duration_max_steps=args.push_duration_max_steps,
+        use_boundary_sampling=args.push_use_boundary_sampling,
     )
     dr_config = DomainRandomizationConfig(
         enabled=bool(args.dr_enabled),

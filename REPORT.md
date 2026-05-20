@@ -122,11 +122,72 @@ v4b에서 warm-start, stress curriculum (force 0→15N, torque 0→0.2 N·m, dur
 
 **Null result**: stress 환경에서 1M 추가 학습했음에도 survival 향상 거의 없음. v4c의 nominal drift도 v4b 대비 약간 악화 (1.18m → 1.37m).
 
-### 5.5 해석
+### 5.5 해석 (E1 측정 후 업데이트)
 
-PPO + 4 env 구조 한계와 일치. 15N × 0.3s 만큼의 impulse는 Ant 0.33kg에 대해 이론상 δv ≈ 13.6 m/s 의 lateral velocity change에 해당 (지면 friction 일부 흡수 가정해도 매우 큼). 이 정도 disturbance에 대해서는 reward signal과 학습 budget이 충분하지 않은 듯하며, 알고리즘 / 병렬화 수준의 변경이 필요할 것으로 추정.
+**E1 (Stress Physics Audit) 측정 결과** (`reports/stress_physics_audit.csv`, 116 rows):
+- 15N × 0.3s push 시 측정 Δv_xy ≈ **12–14 m/s** (first-order estimate 13.6 m/s에 근접). 0.3s 지속 push는 여러 gait cycle을 거치는 동안 contact reaction이 따라잡지 못해 사실상 free-body 가속에 가까운 결과를 보임.
+- 5N × 0.3s에서는 Δv ≈ 1.2–2.7 m/s (first-order 4.5 m/s 대비 훨씬 작음). 작은 force에서는 ground contact가 효과적으로 흡수.
+- 0.2 N·m torque에서 Δω_z ≈ 0.9–2.6 rad/s. 의미 있는 yaw disturbance.
+- v4c가 10N dir=180°에서 동일 force 대비 Δv 감소 (7.14 → 5.36 m/s). survival 동일하나 정책이 push 동안 능동적으로 저항.
+- v4b 15N dir=180°는 push window 내부에서 fall (end_push_state 측정 불가). 가장 극단적 failure direction.
 
-**솔직한 robustness ceiling**: ~10N sustained 0.3s + 0.2 N·m angular impulse 가 현재 학습 setup의 한계점.
+즉, 단순 first-order δv 추정의 직관 (큰 외란) 자체는 잘못되지 않았으나, **force 크기에 따라 contact reaction 효과가 비선형으로 변함** (5N에서는 강하게 흡수, 15N에서는 거의 흡수 안 됨)을 측정으로 확인.
+
+v4c null result의 가능한 원인들 (아직 한 가지로 좁히지 않음):
+
+1. **실제 disturbance가 정말 학습 가능 영역 밖**일 가능성. E1에서 effective Δv를 측정해야 판단 가능.
+2. **Partial observability**: 정책이 "지금 push 들어왔는지 / 얼마나 / 어느 방향"을 명시적으로 모름. MLP single-frame observation으로는 회복 전략을 학습하는 데 한계가 있을 수 있음. RMA / history-stack / RecurrentPPO 등이 다음 후보.
+3. **Recovery reward 부재**: nominal reward (vx tracking, lateral, yaw alignment) 은 "push 후 빠르게 nominal 상태로 돌아가는 것"을 직접 보상하지 않음. Push 후 일정 시간 window에서만 작동하는 recovery reward가 빠져 있음.
+4. **Boundary sampling 부족**: 0 → 15N curriculum에서 5N은 이미 쉬운 영역, 15N은 너무 어려운 영역이라 학습 sample 대부분이 "이미 학습된 영역"이거나 "도달 불가 영역"에 분포. Boundary (8–12N) 집중이 필요.
+
+이 네 가지를 분리 검증하기 전에 알고리즘 (PPO → SAC) 부터 갈아엎으면 원인을 좁히기 어렵다.
+
+## 5.6 E2 — Recovery Metric Grid
+
+E1에서 사용한 strict recovery criterion (50 contiguous step clean state)이 모든 cell에서 trigger 실패 → metric 자체가 Ant gait 특성에 맞지 않음. E2에서는 sliding window mean 기반의 relaxed criterion으로 재정의 + integrated tracking error / max post-push deviation 추가.
+
+E2 결과 (v4b vs v4c, `reports/recovery_metric_grid.csv`):
+- Survival에서 보인 v4c null result가 recovery time / integrated error에서도 동일하게 확인됨.
+- v4c가 10N dir=180°에서만 marginal 개선 (survival 25% → 50%, 그러나 다른 cell 후퇴 상쇄).
+- **결론: v4c의 무효는 "측정 한계"가 아니라 실제 정책 차이 부재**. 따라서 다음 단계는 reward / sampling / observation 구조 변경.
+
+## 5.7 E3 — v4d: Boundary Sampling + Windowed Recovery Reward
+
+E1/E2 결과를 바탕으로, v4c null result의 남은 가설 중 (3) recovery reward 부재 + (4) boundary sampling 부족 두 개를 동시에 attack.
+
+**구현 변경**:
+- `PushDisturbanceWrapper`에 boundary sampling 모드 추가: easy [5-8N, 15-20 step, 0.05-0.10 N·m] / mid [8-12N, 20-30, 0.10-0.18] / hard [12-15N, 25-30, 0.15-0.20], 가중치 20/60/20.
+- `WellTrainedLocomotionAntWrapper`에 windowed recovery reward 추가: push 발생 동안 + push end 후 5초 window에서만 작동하는 `-w * |vx_err|`, `-w * |vy_err|`, `-w * |yaw_err|`, `-w * (roll²+pitch²)`, `-w * |yaw_rate|` 항. window 밖에서는 0 → nominal gait 영향 차단.
+- `PushDisturbanceWrapper`가 `info["push_active"]`, `info["push_steps_since_end"]` 를 inner→outer로 propagate, locomotion wrapper가 이를 읽어 reward gate.
+
+**Training**: v4b warm-start, 1M steps, single seed.
+
+**결과** (`reports/recovery_metric_grid_v4d.csv`):
+
+| F (dir) | v4b surv | v4d surv | Δ |
+|---|---|---|---|
+| 5N (avg) | 100% | 100% | = |
+| 10N (avg) | 75% | 69% | -6% |
+| **15N 0°** | **25%** | **75%** | **+50%** |
+| 15N 90° | 100% | 50% | -50% |
+| 15N 180° | 0% | 25% | +25% |
+| 15N 270° | 25% | 25% | = |
+| 15N (avg) | 38% | **44%** | **+6%** |
+
+Tier A (quiet): v4d survival 1.0, vx 1.75, yaw 0.10 — v4b와 동등. 다만 nominal drift 1.18m → 3.17m로 증가 (recovery reward + boundary curriculum이 nominal gait를 약간 perturbation).
+
+**해석**:
+- v4d가 v4c 대비 명확히 개선 (특히 15N forward, +50% survival). 즉 가설 (3)/(4) 가 v4c 무효의 일부 원인임이 검증됨.
+- 그러나 direction에 따라 mixed (15N 90° lateral은 후퇴). **Cross-direction 일관성 부재** → 남은 가설 (2) Partial observability가 가장 유력한 다음 bottleneck. 정책이 "어느 방향으로 push 들어왔는지"를 single-frame proprio로는 추정 불가하고, 이 한계가 lateral / forward 사이의 transfer를 막는 것으로 보임.
+- Nominal drift 증가 (1.18 → 3.17m)는 recovery reward window가 push 후 5초 켜져 있어, 자연스러운 gait wiggle도 일부 penalty 받기 때문. window 크기를 줄이거나 recovery weight를 낮춰 mitigation 가능.
+
+## 5.8 잠정 robustness ceiling (E1-E3 종합)
+
+세 실험 후 도달한 결론:
+
+- **15N × 0.3s × 0.2 N·m 의 stress 가 절대 학습 불가 영역이 아님**: v4d가 forward dir에서 75% 도달. 단지 v4b/v4c의 reward + sampling 설계가 부족했을 뿐.
+- **정책 ceiling은 아직 partial observability가 깨지 않은 영역**: history-stack / RecurrentPPO / RMA-lite 가 다음 후보.
+- **알고리즘 (PPO → SAC) 변경은 여전히 후순위**: 위 1-2개를 더 시도하기 전엔 SAC 도입은 원인 분리만 어렵게 함.
 
 ## 6. Research Takeaways
 
@@ -147,6 +208,10 @@ PPO + 4 env 구조 한계와 일치. 15N × 0.3s 만큼의 impulse는 Ant 0.33kg
 ### 6.3 정직한 평가의 중요성
 
 **원래 Tier B (brief 0.05s torso-only impulse)는 quadruped 본질적 안정성에 흡수되어 정책 robustness를 거의 probe 하지 못 함.** 진짜 도전적 평가는 (a) 충분한 duration, (b) 각 impulse, (c) 가능하면 random body part 까지 포함해야 함. 짧은 impulse만 평가하는 push robustness 보고는 실제 성능을 과대평가할 위험이 있음.
+
+### 6.4 측정 우선, 알고리즘 변경 후순위
+
+v4c null result에서 즉시 "PPO 한계, SAC로 교체" 결론을 낼 뻔했음. 그러나 E1 (physics audit) → E2 (recovery metric redesign) → E3 (boundary + windowed recovery) 의 isolated cause testing 시퀀스를 거치자 **reward / sampling 설계 변경만으로 일부 stress 조건에서 실질 개선 가능함**이 확인됨 (v4d 15N forward: 25% → 75%). **알고리즘 교체는 reward / observation / sampling 모두 검증한 후에 가야 함**이 이번 사이클의 가장 큰 method-level 교훈.
 
 ## 7. Limitations & Future Directions
 
@@ -178,16 +243,22 @@ PPO + 4 env 구조 한계와 일치. 15N × 0.3s 만큼의 impulse는 Ant 0.33kg
 | 2 | [v4a](runs/robust_locomotion_v4a_seed42_1500k/) | `train_robust_locomotion.py` --push-force-max 10 |
 | 2 | [v4b](runs/robust_locomotion_v4b_stretch20N_seed42_1000k/) | `train_robust_locomotion.py` --push-force-max 20 |
 | 2b | [v4c](runs/robust_locomotion_v4c_stress_seed42_1000k/) | + `--push-torque-z-max 0.20 --push-duration-max-steps 30` |
+| 2c | [v4d](runs/robust_locomotion_v4d_boundary_recovery_seed42_1000k/) | + `--push-use-boundary-sampling --w-recovery-{vx,vy,yaw}-err 0.5 --w-recovery-roll-pitch 1.0 --w-recovery-yaw-rate 0.2` |
 
 평가:
 - Tier A/B/C standard grid: `eval_robust_locomotion.py --tiers abc`
 - Stress grid: `--tier-b-duration-steps 30 --tier-b-torque-z 0.20 --tier-b-randomize-torque-sign`
+- E1 Physics audit: `stress_physics_audit.py --models v4b=...,v4c=...`
+- E2 Recovery metrics: `recovery_metric_grid.py --models v4b=...,v4d=...`
 
 영상 (Phase별 정성 비교):
 - Phase 1: `videos/phase1_candidate_v3h_s2_seed42.mp4`
 - Phase 2: `videos/phase2_v4b_quiet.mp4`, `videos/phase2_v4b_push20N_*.mp4`
 - Phase 2b: `videos/phase2b_v4b_stress_10N_lateral.mp4`, `videos/phase2b_v4c_stress_*.mp4`
+- Phase 2c (v4d): `videos/phase2c_v4d_quiet.mp4`, `videos/phase2c_v4d_stress_15N_*.mp4`
 
 ## 9. Closing
 
-이 프로젝트의 가장 큰 결과는 단일 robust policy 자체가 아니라, **3단계 (nominal → robust → stress eval) 의 정직한 cycle을 통해 PPO + 4 env 셋업에서 가능한 영역과 한계를 명확히 그어냈다는 것**. 추가 작업은 알고리즘 변경 또는 병렬화 수준 변경이 ROI가 높음.
+이 프로젝트의 가장 큰 결과는 단일 robust policy 자체가 아니라, **4단계 (nominal → robust → stress eval → cause isolation) 의 정직한 cycle을 통해 reward 설계 / sampling 분포 / observation 구조가 robustness ceiling에 어떻게 기여하는지 분리 검증한 것**. v4d 결과 (15N forward 25% → 75%) 는 "PPO + 4 env 절대 한계" 라는 결론이 적어도 부분적으로는 잘못된 가설이었음을 보여주며, 알고리즘 변경 (SAC, RMA) 보다 reward / sampling / observation 설계 검증이 먼저 와야 함을 시사함.
+
+다음 가장 유력한 single intervention: **observation history stack 또는 RecurrentPPO**. v4d의 cross-direction inconsistency가 partial observability에서 오는 것이라면 이 방향이 단일 가장 큰 leap이 될 가능성 큼. 이후에도 stress ceiling이 그대로면 그제서야 SAC / RMA-lite 도입을 고려.
